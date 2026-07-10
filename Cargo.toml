@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/mxks-core", "crates/mxks-platform", "crates/mxks-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Max K"]
+repository = "https://github.com/maxk/mx-keyboard-switcher"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

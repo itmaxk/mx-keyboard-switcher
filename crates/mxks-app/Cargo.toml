@@ -1,0 +1,33 @@
+[package]
+name = "mxks-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "mx-keyboard-switcher"
+
+[[bin]]
+name = "mx-keyboard-switcher"
+path = "src/main.rs"
+
+[features]
+# Tray icon. On by default. On Linux this needs `libdbus-1-dev` at build time;
+# disable with `--no-default-features` to build a headless binary. On non-Linux
+# the tray is not yet implemented and the app runs headless regardless.
+default = ["tray"]
+tray = ["dep:ksni"]
+
+[dependencies]
+mxks-core = { path = "../mxks-core" }
+mxks-platform = { path = "../mxks-platform" }
+crossbeam-channel = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure-Rust StatusNotifierItem tray (zbus, no GTK/libdbus). Lightweight
+# async-io runtime instead of tokio.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"], optional = true }
