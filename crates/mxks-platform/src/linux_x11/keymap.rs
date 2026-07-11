@@ -14,6 +14,9 @@ pub const KC_BACKSPACE: u8 = 14 + X_OFFSET;
 /// X11 keycode of Space (evdev KEY_SPACE = 57).
 pub const KC_SPACE: u8 = 57 + X_OFFSET;
 
+/// X11 keycode of Left Shift (evdev KEY_LEFTSHIFT = 42).
+pub const KC_SHIFT: u8 = 42 + X_OFFSET;
+
 /// (evdev code, PhysKey) for every letter-block key we track.
 const LETTERS: &[(u8, PhysKey)] = &[
     (16, PhysKey::Q),

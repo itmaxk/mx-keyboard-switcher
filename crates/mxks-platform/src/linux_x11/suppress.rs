@@ -1,60 +1,46 @@
-//! Shared state that lets the capture thread drop our own injected events.
+//! Shared state that lets the capture thread drop our own injected key events.
 //!
-//! Two mechanisms:
-//! * Text is injected through a dedicated *spare* keycode that never occurs in
-//!   normal typing, so any event on it is ours and is dropped unconditionally.
-//! * Backspaces reuse the real Backspace keycode, so the injector bumps a
-//!   counter before sending; the capture thread drops exactly that many
-//!   Backspace key-downs.
+//! The injector taps real keycodes (letters, Backspace, Shift, Space). Before
+//! sending each key-press it registers that keycode here; the capture thread
+//! drops exactly that many presses of that keycode. This is order-independent
+//! and robust to interleaving with a fast typist.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 
-/// Shared suppression handshake between injector and capture.
+/// Per-keycode count of injected key-presses still expected to echo back.
 #[derive(Clone)]
 pub struct Suppress {
-    inner: Arc<Inner>,
+    pending: Arc<Vec<AtomicU16>>,
 }
 
-struct Inner {
-    spare_keycode: u8,
-    pending_backspaces: AtomicUsize,
+impl Default for Suppress {
+    fn default() -> Self {
+        Suppress {
+            pending: Arc::new((0..256).map(|_| AtomicU16::new(0)).collect()),
+        }
+    }
 }
 
 impl Suppress {
-    pub fn new(spare_keycode: u8) -> Self {
-        Suppress {
-            inner: Arc::new(Inner {
-                spare_keycode,
-                pending_backspaces: AtomicUsize::new(0),
-            }),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Called by the injector before sending `n` Backspace key events.
-    pub fn expect_backspaces(&self, n: usize) {
-        self.inner.pending_backspaces.fetch_add(n, Ordering::SeqCst);
+    /// Register that we are about to inject one key-press of `keycode`.
+    pub fn expect(&self, keycode: u8) {
+        self.pending[keycode as usize].fetch_add(1, Ordering::SeqCst);
     }
 
     /// Called by the capture thread for each observed key-down. Returns true if
-    /// the event is one of ours and should be dropped.
-    pub fn should_drop(&self, x_keycode: u8, is_backspace: bool) -> bool {
-        if x_keycode == self.inner.spare_keycode {
-            return true;
-        }
-        if is_backspace {
-            // Decrement only if positive.
-            let mut cur = self.inner.pending_backspaces.load(Ordering::SeqCst);
-            while cur > 0 {
-                match self.inner.pending_backspaces.compare_exchange_weak(
-                    cur,
-                    cur - 1,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => return true,
-                    Err(actual) => cur = actual,
-                }
+    /// this is one of our injected presses and should be dropped.
+    pub fn should_drop(&self, keycode: u8) -> bool {
+        let slot = &self.pending[keycode as usize];
+        let mut cur = slot.load(Ordering::SeqCst);
+        while cur > 0 {
+            match slot.compare_exchange_weak(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
             }
         }
         false

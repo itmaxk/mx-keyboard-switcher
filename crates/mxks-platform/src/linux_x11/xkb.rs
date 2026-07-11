@@ -6,7 +6,6 @@
 
 use anyhow::{anyhow, Result};
 use mxks_core::layout::Lang;
-use x11rb::connection::Connection;
 use x11rb::protocol::xkb::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -95,17 +94,20 @@ impl XkbLayout {
             .group_of_lang(lang)
             .ok_or_else(|| anyhow!("no XKB group for {:?}", lang))?;
         let group = xkb::Group::from(g);
-        self.conn.xkb_latch_lock_state(
-            xkb::ID::USE_CORE_KBD.into(),
-            0u16.into(), // affect_mod_locks
-            0u16.into(), // mod_locks
-            true,        // lock_group
-            group,       // group_lock
-            0u16.into(), // affect_mod_latches
-            false,       // latch_group
-            0,           // group_latch
-        )?;
-        self.conn.flush()?;
+        self.conn
+            .xkb_latch_lock_state(
+                xkb::ID::USE_CORE_KBD.into(),
+                0u16.into(), // affect_mod_locks
+                0u16.into(), // mod_locks
+                true,        // lock_group
+                group,       // group_lock
+                0u16.into(), // affect_mod_latches
+                false,       // latch_group
+                0,           // group_latch
+            )?
+            // Round-trip so the group is actually applied before the caller
+            // replays keycodes that depend on it.
+            .check()?;
         Ok(())
     }
 }

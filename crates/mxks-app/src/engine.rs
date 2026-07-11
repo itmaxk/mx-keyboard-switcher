@@ -153,6 +153,17 @@ impl Engine {
             let params = self.params();
             analyze(&word, &params)
         };
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let typed = mxks_core::convert::render_keys(&word.keys, word.lang);
+            let converted = mxks_core::convert::render_keys(&word.keys, word.lang.other());
+            tracing::debug!(
+                "word: active={:?} typed={:?} converted={:?} verdict={:?}",
+                word.lang,
+                typed,
+                converted,
+                verdict
+            );
+        }
         if let Verdict::Correct(conv) = verdict {
             match self.corrector.autocorrect(&word, &conv, &trailing) {
                 Ok(()) => {

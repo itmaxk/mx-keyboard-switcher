@@ -91,8 +91,7 @@ impl X11Capture {
         let keycode = data[1];
         let state = u16::from_le_bytes([data[28], data[29]]);
 
-        let is_backspace = keycode == KC_BACKSPACE;
-        if self.suppress.should_drop(keycode, is_backspace) {
+        if self.suppress.should_drop(keycode) {
             return Ok(());
         }
 

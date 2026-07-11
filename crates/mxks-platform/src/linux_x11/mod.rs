@@ -8,7 +8,7 @@ mod record;
 mod suppress;
 mod xkb;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use mxks_core::hotkey::HotkeySpec;
 use mxks_core::layout::Lang;
 use x11rb::connection::Connection;
@@ -21,10 +21,9 @@ use suppress::Suppress;
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
     check_display()?;
 
-    let (spare, per) = find_spare_keycode()?;
-    let suppress = Suppress::new(spare);
+    let suppress = Suppress::new();
 
-    let injector = inject::X11Injector::new(suppress.clone(), spare, per)?;
+    let injector = inject::X11Injector::new(suppress.clone())?;
     let layout = XkbSwitcher(xkb::XkbLayout::new()?);
     let focus = LinuxFocus::new()?;
     let capture = record::X11Capture::new(suppress, hotkey);
@@ -53,27 +52,6 @@ fn check_display() -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Find an unused keycode (all keysyms NoSymbol) to borrow for text injection,
-/// and the server's keysyms-per-keycode.
-fn find_spare_keycode() -> Result<(u8, u8)> {
-    let (conn, _) = RustConnection::connect(None)?;
-    let setup = conn.setup();
-    let min = setup.min_keycode;
-    let max = setup.max_keycode;
-    let count = max - min + 1;
-    let map = conn.get_keyboard_mapping(min, count)?.reply()?;
-    let per = map.keysyms_per_keycode as usize;
-
-    // Prefer a high keycode; scan downward for an all-NoSymbol row.
-    for i in (0..count as usize).rev() {
-        let row = &map.keysyms[i * per..(i + 1) * per];
-        if row.iter().all(|&s| s == 0) {
-            return Ok(((min as usize + i) as u8, per as u8));
-        }
-    }
-    Err(anyhow!("no spare keycode available for text injection"))
 }
 
 /// Adapter so the concrete XKB type satisfies the `LayoutSwitcher` trait.
