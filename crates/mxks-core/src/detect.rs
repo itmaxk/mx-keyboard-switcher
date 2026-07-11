@@ -82,11 +82,13 @@ pub fn analyze(word: &Word, params: &Params) -> Verdict {
         dict::contains(&typed, typed_lang) || in_list(extra(params, typed_lang), &typed_l);
     let conv_valid = dict::contains(&conv, conv_lang) || in_list(extra(params, conv_lang), &conv_l);
 
-    // Decisive dictionary signals.
-    if typed_valid && !conv_valid {
+    // Decisive dictionary signals. If the typed form is a real word in its own
+    // layout, keep it — the user most likely meant it (and this keeps large
+    // dictionaries from creating false positives when both forms are "words").
+    if typed_valid {
         return Verdict::Keep;
     }
-    if conv_valid && !typed_valid {
+    if conv_valid {
         return Verdict::Correct(conv);
     }
 
@@ -216,6 +218,16 @@ mod tests {
         assert_eq!(
             analyze(&w, &Params::default()),
             Verdict::Correct("привет".to_string())
+        );
+    }
+
+    #[test]
+    fn corrects_it_term_git() {
+        // "пше" typed while RU active is really "git" (a dictionary IT term now).
+        let w = typed_word("пше", Lang::Ru);
+        assert_eq!(
+            analyze(&w, &Params::default()),
+            Verdict::Correct("git".to_string())
         );
     }
 

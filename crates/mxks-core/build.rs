@@ -19,20 +19,30 @@ const EN_ALPHABET: &str = "abcdefghijklmnopqrstuvwxyz";
 const RU_ALPHABET: &str = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя";
 
 /// Cap dictionary sizes to keep the binary small.
-const EN_MAX: usize = 10_000;
-const RU_MAX: usize = 30_000;
+const EN_MAX: usize = 45_000;
+const RU_MAX: usize = 50_000;
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let data = manifest.join("..").join("..").join("data");
-    let en_path = data.join("google-10000-english.txt");
+    // English: a large frequency list, a clean common-word list, and curated
+    // IT/CLI terms that frequency lists miss.
+    let en_freq = data.join("en_50k.txt");
+    let en_common = data.join("google-10000-english.txt");
+    let it_terms = data.join("it_terms.txt");
     let ru_path = data.join("ru_50k.txt");
 
-    println!("cargo:rerun-if-changed={}", en_path.display());
-    println!("cargo:rerun-if-changed={}", ru_path.display());
+    for p in [&en_freq, &en_common, &it_terms, &ru_path] {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
 
-    let en_words = load_en(&en_path);
-    let ru_words = load_ru(&ru_path);
+    let mut en_words = load_freq(&en_freq, EN_ALPHABET, EN_MAX);
+    merge_plain(&mut en_words, &en_common, EN_ALPHABET);
+    merge_plain(&mut en_words, &it_terms, EN_ALPHABET);
+    let en_words: Vec<String> = en_words.into_iter().collect();
+    let ru_words = load_freq(&ru_path, RU_ALPHABET, RU_MAX)
+        .into_iter()
+        .collect::<Vec<_>>();
 
     let en_bigram = bigram_table(&en_words, EN_ALPHABET);
     let ru_bigram = bigram_table(&ru_words, RU_ALPHABET);
@@ -60,36 +70,33 @@ fn main() {
     fs::write(out_dir.join("tables.rs"), out).unwrap();
 }
 
-/// Load EN words: one per line, keep only pure a-z words.
-fn load_en(path: &PathBuf) -> Vec<String> {
+/// Load a "word frequency" file (`word count` per line, most-frequent first),
+/// keeping up to `max` words that are pure letters of `alphabet`.
+fn load_freq(path: &PathBuf, alphabet: &str, max: usize) -> BTreeSet<String> {
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut set = BTreeSet::new();
-    for line in text.lines().take(EN_MAX) {
+    let mut taken = 0usize;
+    for line in text.lines() {
+        if taken >= max {
+            break;
+        }
+        let word = line.split_whitespace().next().unwrap_or("").to_lowercase();
+        if !word.is_empty() && word.chars().all(|c| alphabet.contains(c)) && set.insert(word) {
+            taken += 1;
+        }
+    }
+    set
+}
+
+/// Merge a plain one-word-per-line list into `set` (all entries kept).
+fn merge_plain(set: &mut BTreeSet<String>, path: &PathBuf, alphabet: &str) {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    for line in text.lines() {
         let w = line.trim().to_lowercase();
-        if !w.is_empty() && w.chars().all(|c| EN_ALPHABET.contains(c)) {
+        if !w.is_empty() && w.chars().all(|c| alphabet.contains(c)) {
             set.insert(w);
         }
     }
-    set.into_iter().collect()
-}
-
-/// Load RU words from a "word frequency" file, keep only pure Cyrillic words.
-fn load_ru(path: &PathBuf) -> Vec<String> {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let mut set = BTreeSet::new();
-    for line in text.lines() {
-        let word = line.split_whitespace().next().unwrap_or("").to_lowercase();
-        if word.is_empty() {
-            continue;
-        }
-        if word.chars().all(|c| RU_ALPHABET.contains(c)) {
-            set.insert(word);
-            if set.len() >= RU_MAX {
-                break;
-            }
-        }
-    }
-    set.into_iter().collect()
 }
 
 /// Build a Laplace-smoothed bigram log-probability matrix over
