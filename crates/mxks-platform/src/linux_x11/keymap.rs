@@ -104,6 +104,14 @@ pub fn key_letter_name(x_keycode: u8) -> Option<String> {
     }
 }
 
+/// True if `sym` is a modifier key (Shift/Control/Alt/Super/Caps/…). Pressing
+/// these alone should neither reset the word buffer nor be recorded as a hotkey.
+pub fn is_modifier_keysym(sym: u32) -> bool {
+    (0xffe1..=0xffee).contains(&sym) // Shift_L..Hyper_R
+        || sym == 0xfe03 // ISO_Level3_Shift (AltGr)
+        || sym == 0xff7f // Num_Lock
+}
+
 /// Canonical hotkey name for a named (non-letter) X keysym, if recognized.
 pub fn named_keysym(sym: u32) -> Option<&'static str> {
     Some(match sym {

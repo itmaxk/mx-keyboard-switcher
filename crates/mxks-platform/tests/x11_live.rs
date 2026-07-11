@@ -28,6 +28,63 @@ fn raw_tap(x_keycode: u8) {
     conn.flush().unwrap();
 }
 
+/// Press or release a single keycode (no auto-release), to build sequences.
+fn raw_key(x_keycode: u8, press: bool) {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+    let (conn, _) = RustConnection::connect(None).unwrap();
+    let ty = if press {
+        KEY_PRESS_EVENT
+    } else {
+        KEY_RELEASE_EVENT
+    };
+    conn.xtest_fake_input(ty, x_keycode, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    conn.flush().unwrap();
+}
+
+/// Reproduce the phantom Control that real Pause keys emit (scancode carries a
+/// Ctrl prefix): Control held while Pause is pressed must still fire the hotkey,
+/// and the Control key must not surface as a buffer-resetting event.
+#[test]
+#[ignore = "requires a live X server"]
+fn pause_with_phantom_control_fires() {
+    let Backend { mut capture, .. } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut saw_hotkey = false;
+    let mut saw_reset = false;
+    for _ in 0..30 {
+        raw_key(37, true); // Control_L down (phantom)
+        raw_tap(110); // Pause (state now includes Control)
+        raw_key(37, false); // Control_L up
+        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+            match ev.kind {
+                KeyKind::Hotkey => saw_hotkey = true,
+                KeyKind::Reset => saw_reset = true,
+                _ => {}
+            }
+        }
+        if saw_hotkey {
+            break;
+        }
+    }
+    assert!(
+        saw_hotkey,
+        "Pause with phantom Control did not fire the hotkey"
+    );
+    assert!(
+        !saw_reset,
+        "phantom Control produced a buffer-resetting event"
+    );
+}
+
 /// The default Pause hotkey must be recognized regardless of its keycode
 /// (110 here, 127 elsewhere) via keysym-name matching.
 #[test]

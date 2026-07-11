@@ -42,6 +42,7 @@ pub struct X11Capture {
     min_keycode: u8,
 }
 
+#[derive(Clone, Copy)]
 struct Mods {
     shift: bool,
     ctrl: bool,
@@ -101,13 +102,38 @@ impl X11Capture {
         }
     }
 
+    /// True if `keycode` is a modifier key (Ctrl/Shift/Alt/Super/…).
+    fn is_modifier(&self, keycode: u8) -> bool {
+        if self.per == 0 || keycode < self.min_keycode {
+            return false;
+        }
+        let base = (keycode - self.min_keycode) as usize * self.per;
+        (0..self.per).any(|off| {
+            self.keysyms
+                .get(base + off)
+                .is_some_and(|&s| keymap::is_modifier_keysym(s))
+        })
+    }
+
+    /// Normalize the modifier state for a resolved key name. The Pause/Break key
+    /// emits a phantom Control on many keyboards (its scancode contains a Ctrl
+    /// prefix), so we ignore Control for it — otherwise plain "Pause" never
+    /// matches.
+    fn norm_mods(name: &Option<String>, m: &Mods) -> Mods {
+        let mut m = *m;
+        if matches!(name.as_deref(), Some("PAUSE")) {
+            m.ctrl = false;
+        }
+        m
+    }
+
     /// Build a HotkeySpec for a captured key, if it is a sensible hotkey (a
     /// named key, or any key combined with a modifier — never a bare letter).
-    fn capture_spec(&self, keycode: u8, m: &Mods) -> Option<HotkeySpec> {
-        let name = self.name_of(keycode)?;
+    fn capture_spec(&self, name: &Option<String>, m: &Mods) -> Option<HotkeySpec> {
+        let name = name.clone()?;
+        let m = Self::norm_mods(&Some(name.clone()), m);
         let has_mod = m.ctrl || m.alt || m.meta;
-        let is_bare_letter = name.len() == 1 && !has_mod;
-        if is_bare_letter {
+        if name.len() == 1 && !has_mod {
             return None; // avoid footgun: a plain letter as the hotkey
         }
         Some(HotkeySpec {
@@ -119,12 +145,15 @@ impl X11Capture {
         })
     }
 
-    fn matches_hotkey(&self, keycode: u8, m: &Mods) -> bool {
+    fn matches_hotkey(&self, name: &Option<String>, m: &Mods) -> bool {
         let spec = self.hotkey.current();
-        match self.name_of(keycode) {
+        match name {
             Some(name) => {
+                // Pause carries a phantom Control on many keyboards, so don't
+                // compare Control for it (match "Pause" and "Ctrl+Pause" alike).
+                let ignore_ctrl = name.eq_ignore_ascii_case("PAUSE");
                 name.eq_ignore_ascii_case(&spec.key)
-                    && m.ctrl == spec.ctrl
+                    && (ignore_ctrl || m.ctrl == spec.ctrl)
                     && m.shift == spec.shift
                     && m.alt == spec.alt
                     && m.meta == spec.meta
@@ -135,11 +164,15 @@ impl X11Capture {
 
     fn classify(&self, keycode: u8, state: u16) -> Option<KeyKind> {
         let m = Self::mods(state);
+        let name = self.name_of(keycode);
 
-        if self.matches_hotkey(keycode, &m) {
+        if self.matches_hotkey(&name, &m) {
             return Some(KeyKind::Hotkey);
         }
-
+        // Bare modifier keys (incl. Pause's phantom Ctrl) must not reset the buffer.
+        if self.is_modifier(keycode) {
+            return None;
+        }
         if m.ctrl || m.alt || m.meta {
             return Some(KeyKind::Reset);
         }
@@ -178,7 +211,8 @@ impl X11Capture {
         // Capture mode: record the next sensible key as the new hotkey.
         if self.hotkey.is_capturing() {
             let m = Self::mods(state);
-            if let Some(spec) = self.capture_spec(keycode, &m) {
+            let name = self.name_of(keycode);
+            if let Some(spec) = self.capture_spec(&name, &m) {
                 self.hotkey.record(spec);
             }
             return Ok(()); // swallow while capturing

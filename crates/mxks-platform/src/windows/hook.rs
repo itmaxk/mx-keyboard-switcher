@@ -51,6 +51,7 @@ fn key_down(vk: i32) -> bool {
     (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
 }
 
+#[derive(Clone, Copy)]
 struct Mods {
     shift: bool,
     ctrl: bool,
@@ -67,6 +68,23 @@ fn current_mods() -> Mods {
     }
 }
 
+/// True if `vk` is a modifier key; pressing it alone must not reset the buffer.
+fn is_modifier_vk(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0x14 | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5
+    )
+}
+
+/// Ignore the phantom Control that a Pause key may carry.
+fn norm_mods(name: &Option<String>, m: &Mods) -> Mods {
+    let mut m = *m;
+    if matches!(name.as_deref(), Some("PAUSE")) {
+        m.ctrl = false;
+    }
+    m
+}
+
 /// Canonical hotkey name for a key: letters via scan code, named keys via VK.
 fn name_of(kb: &KBDLLHOOKSTRUCT) -> Option<String> {
     if let Some(name) = keymap::key_letter_name(kb.scanCode) {
@@ -77,6 +95,7 @@ fn name_of(kb: &KBDLLHOOKSTRUCT) -> Option<String> {
 
 fn capture_spec(kb: &KBDLLHOOKSTRUCT, m: &Mods) -> Option<HotkeySpec> {
     let name = name_of(kb)?;
+    let m = norm_mods(&Some(name.clone()), m);
     let has_mod = m.ctrl || m.alt || m.meta;
     if name.len() == 1 && !has_mod {
         return None; // avoid a bare-letter hotkey
@@ -94,8 +113,9 @@ fn matches_hotkey(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> bool {
     let spec = shared.hotkey.current();
     match name_of(kb) {
         Some(name) => {
+            let ignore_ctrl = name.eq_ignore_ascii_case("PAUSE");
             name.eq_ignore_ascii_case(&spec.key)
-                && m.ctrl == spec.ctrl
+                && (ignore_ctrl || m.ctrl == spec.ctrl)
                 && m.shift == spec.shift
                 && m.alt == spec.alt
                 && m.meta == spec.meta
@@ -109,6 +129,9 @@ fn classify(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> Option<KeyKind> 
 
     if matches_hotkey(shared, kb, m) {
         return Some(KeyKind::Hotkey);
+    }
+    if is_modifier_vk(kb.vkCode as u16) {
+        return None;
     }
     if m.ctrl || m.alt || m.meta {
         return Some(KeyKind::Reset);
