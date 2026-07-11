@@ -44,6 +44,15 @@ pub struct Status {
     pub capturing: bool,
 }
 
+/// The result of the most recent *manual* conversion, kept so the hotkey can
+/// toggle it back and forth as long as nothing else is typed.
+struct Toggle {
+    keys: Vec<Stroke>,
+    trailing: String,
+    /// The layout the text is currently displayed in.
+    lang: Lang,
+}
+
 pub struct Engine {
     buffer: WordBuffer,
     config: Config,
@@ -55,6 +64,8 @@ pub struct Engine {
     capturing: bool,
     /// Last completed word + its trailing separator, for the manual hotkey.
     last: Option<(Word, String)>,
+    /// State for toggling the last manual conversion back and forth.
+    toggle: Option<Toggle>,
     /// Broadcasts status changes so the tray can update its menu.
     status_tx: Option<Sender<Status>>,
 }
@@ -77,6 +88,7 @@ impl Engine {
             enabled: true,
             capturing: false,
             last: None,
+            toggle: None,
             status_tx: None,
         }
     }
@@ -141,6 +153,10 @@ impl Engine {
         if !ev.down || ev.injected {
             return;
         }
+        // Any real typing invalidates the manual-conversion toggle.
+        if !matches!(ev.kind, KeyKind::Hotkey) {
+            self.toggle = None;
+        }
         match ev.kind {
             KeyKind::Letter { key, shift } => {
                 if self.buffer.is_empty() {
@@ -200,9 +216,10 @@ impl Engine {
             );
         }
         if let Verdict::Correct(conv) = verdict {
-            match self.corrector.autocorrect(&word, &conv, &trailing) {
+            let to = word.lang.other();
+            match self.corrector.convert(&word.keys, word.lang, to, &trailing) {
                 Ok(()) => {
-                    self.active = word.lang.other();
+                    self.active = to;
                     self.last = None;
                     tracing::debug!("corrected -> {conv}");
                 }
@@ -211,29 +228,57 @@ impl Engine {
         }
     }
 
+    /// The conversion hotkey. First press converts the current (or last) word
+    /// and switches layout; pressing it again with nothing typed in between
+    /// toggles the same word back and forth.
     fn manual_convert(&mut self) {
         if !self.enabled {
             return;
         }
-        // Prefer the in-progress word; otherwise the last completed word.
-        if let Some(word) = self.buffer.current() {
-            match self.corrector.manual(&word) {
-                Ok(_) => {
-                    self.active = word.lang.other();
-                    self.buffer.clear();
-                    self.buffer.set_lang(self.active);
-                }
-                Err(e) => tracing::warn!("manual convert failed: {e:#}"),
-            }
-        } else if let Some((word, trailing)) = self.last.take() {
-            let converted = mxks_core::convert::render_keys(&word.keys, word.lang.other());
-            match self.corrector.autocorrect(&word, &converted, &trailing) {
+
+        // Toggle the previous manual conversion back and forth.
+        if let Some(t) = self.toggle.take() {
+            let to = t.lang.other();
+            match self.corrector.convert(&t.keys, t.lang, to, &t.trailing) {
                 Ok(()) => {
-                    self.active = word.lang.other();
+                    self.active = to;
                     self.buffer.set_lang(self.active);
+                    self.toggle = Some(Toggle {
+                        keys: t.keys,
+                        trailing: t.trailing,
+                        lang: to,
+                    });
                 }
-                Err(e) => tracing::warn!("manual convert failed: {e:#}"),
+                Err(e) => {
+                    tracing::warn!("toggle convert failed: {e:#}");
+                    self.toggle = Some(t);
+                }
             }
+            return;
+        }
+
+        // First conversion: prefer the in-progress word, else the last completed.
+        let (keys, from, trailing) = if let Some(word) = self.buffer.current() {
+            (word.keys, word.lang, String::new())
+        } else if let Some((word, trailing)) = self.last.take() {
+            (word.keys, word.lang, trailing)
+        } else {
+            return;
+        };
+
+        let to = from.other();
+        match self.corrector.convert(&keys, from, to, &trailing) {
+            Ok(()) => {
+                self.active = to;
+                self.buffer.clear();
+                self.buffer.set_lang(self.active);
+                self.toggle = Some(Toggle {
+                    keys,
+                    trailing,
+                    lang: to,
+                });
+            }
+            Err(e) => tracing::warn!("manual convert failed: {e:#}"),
         }
     }
 
@@ -357,6 +402,13 @@ mod tests {
             injected: false,
         }
     }
+    fn hotkey() -> KeyEvent {
+        KeyEvent {
+            kind: KeyKind::Hotkey,
+            down: true,
+            injected: false,
+        }
+    }
 
     /// Typing "ghbdtn " in English must produce the exact correction sequence:
     /// erase 6 letters + the space, switch to Russian, retype "привет" + " ".
@@ -429,5 +481,56 @@ mod tests {
 
         engine.run(key_rx, cmd_rx);
         assert!(log.lock().unwrap().is_empty(), "valid word was modified");
+    }
+
+    /// Pressing the hotkey converts the in-progress word; pressing it again with
+    /// nothing typed in between toggles it back.
+    #[test]
+    fn hotkey_toggles_conversion() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let corrector = Corrector::new(
+            Box::new(MockInjector(log.clone())),
+            Box::new(MockLayout {
+                log: log.clone(),
+                current: Lang::En,
+            }),
+        );
+        let (_hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        let mut engine = Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle);
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        // Type "ghbdtn" (no space), then press the hotkey twice.
+        for k in [
+            PhysKey::G,
+            PhysKey::H,
+            PhysKey::B,
+            PhysKey::D,
+            PhysKey::T,
+            PhysKey::N,
+        ] {
+            key_tx.send(letter(k)).unwrap();
+        }
+        key_tx.send(hotkey()).unwrap();
+        key_tx.send(hotkey()).unwrap();
+        drop(key_tx);
+
+        engine.run(key_rx, cmd_rx);
+
+        let ops = log.lock().unwrap().clone();
+        assert_eq!(
+            ops,
+            vec![
+                // First press: EN -> RU.
+                Op::Backspaces(6),
+                Op::Switch(Lang::Ru),
+                Op::Type("привет".to_string()),
+                // Second press: toggle back RU -> EN.
+                Op::Backspaces(6),
+                Op::Switch(Lang::En),
+                Op::Type("ghbdtn".to_string()),
+            ]
+        );
     }
 }

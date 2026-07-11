@@ -1,9 +1,10 @@
-//! Applies corrections: erase the typed word, switch the system layout, retype
-//! the converted text. Owns the injector and layout switcher.
+//! Applies corrections: erase the currently displayed text, switch the system
+//! layout, retype the text through the target layout. Owns the injector and
+//! layout switcher.
 
 use anyhow::Result;
-use mxks_core::buffer::Word;
-use mxks_core::convert::render_keys;
+use mxks_core::convert::{render_keys, Stroke};
+use mxks_core::layout::Lang;
 use mxks_platform::{KeyInjector, LayoutSwitcher};
 
 pub struct Corrector {
@@ -16,33 +17,28 @@ impl Corrector {
         Corrector { injector, layout }
     }
 
-    /// Replace a just-completed word with `converted`, switching to the other
-    /// layout. `trailing` is the separator already on screen after the word
-    /// (e.g. `" "`); it is erased and re-typed so the caret ends up past it.
-    pub fn autocorrect(&mut self, word: &Word, converted: &str, trailing: &str) -> Result<()> {
-        let erase = word.keys.len() + trailing.chars().count();
+    /// Re-render `keys` from its current layout `from` into `to`: erase what is
+    /// on screen (the `from` rendering plus `trailing`), switch the system
+    /// layout to `to`, and type the `to` rendering plus `trailing`.
+    ///
+    /// Erase length is computed from the actual rendered text (not the key
+    /// count), so it is correct even when the two layouts render different
+    /// character counts.
+    pub fn convert(&mut self, keys: &[Stroke], from: Lang, to: Lang, trailing: &str) -> Result<()> {
+        let current = render_keys(keys, from);
+        let erase = current.chars().count() + trailing.chars().count();
         self.injector.backspaces(erase)?;
-        self.layout.switch_to(word.lang.other())?;
-        self.injector.type_text(converted)?;
+        self.layout.switch_to(to)?;
+        let text = render_keys(keys, to);
+        self.injector.type_text(&text)?;
         if !trailing.is_empty() {
             self.injector.type_text(trailing)?;
         }
         Ok(())
     }
 
-    /// Manually convert an in-progress word (no separator typed yet): erase it,
-    /// switch layout, retype it through the other layout. Returns the converted
-    /// text.
-    pub fn manual(&mut self, word: &Word) -> Result<String> {
-        let converted = render_keys(&word.keys, word.lang.other());
-        self.injector.backspaces(word.keys.len())?;
-        self.layout.switch_to(word.lang.other())?;
-        self.injector.type_text(&converted)?;
-        Ok(converted)
-    }
-
     /// Read the current system layout, if it is EN or RU.
-    pub fn current_layout(&self) -> Option<mxks_core::layout::Lang> {
+    pub fn current_layout(&self) -> Option<Lang> {
         self.layout.current().ok().flatten()
     }
 }
