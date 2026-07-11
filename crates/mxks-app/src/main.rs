@@ -51,7 +51,8 @@ fn run() -> Result<()> {
     tray::start(cmd_tx, status_rx);
 
     let corrector = Corrector::new(backend.injector, backend.layout);
-    let mut app = Engine::new(config, corrector, backend.focus).with_status_channel(status_tx);
+    let mut app = Engine::new(config, corrector, backend.focus, backend.hotkey)
+        .with_status_channel(status_tx);
 
     tracing::info!("MX Keyboard Switcher running");
     app.run(key_rx, cmd_rx);

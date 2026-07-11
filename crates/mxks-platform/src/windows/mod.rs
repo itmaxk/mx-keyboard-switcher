@@ -16,11 +16,13 @@ use crate::{Backend, FocusInfo};
 pub const MAGIC: usize = 0x4B42_5357; // "KBSW"
 
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
+    let (control, handle) = crate::hotkey_channel(hotkey);
     Ok(Backend {
-        capture: Box::new(hook::WinCapture::new(hotkey)),
+        capture: Box::new(hook::WinCapture::new(control)),
         injector: Box::new(inject::WinInjector),
         layout: Box::new(layout::WinLayout),
         focus: Box::new(WinFocus),
+        hotkey: handle,
     })
 }
 

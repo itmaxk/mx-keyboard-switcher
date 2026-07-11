@@ -22,17 +22,19 @@ pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
     check_display()?;
 
     let suppress = Suppress::new();
+    let (control, handle) = crate::hotkey_channel(hotkey);
 
     let injector = inject::X11Injector::new(suppress.clone())?;
     let layout = XkbSwitcher(xkb::XkbLayout::new()?);
     let focus = LinuxFocus::new()?;
-    let capture = record::X11Capture::new(suppress, hotkey);
+    let capture = record::X11Capture::new(suppress, control);
 
     Ok(Backend {
         capture: Box::new(capture),
         injector: Box::new(injector),
         layout: Box::new(layout),
         focus: Box::new(focus),
+        hotkey: handle,
     })
 }
 

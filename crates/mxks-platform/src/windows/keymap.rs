@@ -64,40 +64,44 @@ pub fn is_boundary(scan: u32) -> bool {
     BOUNDARIES.contains(&scan)
 }
 
-/// Map a canonical hotkey key name to a Win32 virtual-key code.
-pub fn vk_for_name(name: &str) -> Option<u16> {
-    let vk = match name {
-        "PAUSE" => 0x13,      // VK_PAUSE
-        "SCROLLLOCK" => 0x91, // VK_SCROLL
-        "INSERT" => 0x2D,
-        "HOME" => 0x24,
-        "END" => 0x23,
-        "PAGEUP" => 0x21,
-        "PAGEDOWN" => 0x22,
-        "MENU" => 0x5D, // VK_APPS
-        "CAPSLOCK" => 0x14,
-        "SPACE" => 0x20,
-        "F1" => 0x70,
-        "F2" => 0x71,
-        "F3" => 0x72,
-        "F4" => 0x73,
-        "F5" => 0x74,
-        "F6" => 0x75,
-        "F7" => 0x76,
-        "F8" => 0x77,
-        "F9" => 0x78,
-        "F10" => 0x79,
-        "F11" => 0x7A,
-        "F12" => 0x7B,
-        s if s.len() == 1 => {
-            let c = s.chars().next().unwrap().to_ascii_uppercase();
-            if c.is_ascii_alphabetic() {
-                c as u16 // VK for 'A'..'Z' equals the ASCII code
-            } else {
-                return None;
-            }
-        }
+/// Canonical hotkey name for a letter key, from its scan code (layout-independent).
+pub fn key_letter_name(scan: u32) -> Option<String> {
+    let key = phys_of(scan)?;
+    let c = mxks_core::layout::key_to_char(key, mxks_core::layout::Lang::En)?;
+    if c.is_ascii_alphabetic() {
+        Some(c.to_ascii_uppercase().to_string())
+    } else {
+        None
+    }
+}
+
+/// Canonical hotkey name for a Win32 virtual-key code (named keys and letters).
+pub fn vk_name(vk: u16) -> Option<String> {
+    let named = match vk {
+        0x13 => "PAUSE",
+        0x91 => "SCROLLLOCK",
+        0x2D => "INSERT",
+        0x24 => "HOME",
+        0x23 => "END",
+        0x21 => "PAGEUP",
+        0x22 => "PAGEDOWN",
+        0x5D => "MENU",
+        0x14 => "CAPSLOCK",
+        0x20 => "SPACE",
+        0x70 => "F1",
+        0x71 => "F2",
+        0x72 => "F3",
+        0x73 => "F4",
+        0x74 => "F5",
+        0x75 => "F6",
+        0x76 => "F7",
+        0x77 => "F8",
+        0x78 => "F9",
+        0x79 => "F10",
+        0x7A => "F11",
+        0x7B => "F12",
+        0x41..=0x5A => return Some(char::from(vk as u8).to_string()), // 'A'..'Z'
         _ => return None,
     };
-    Some(vk)
+    Some(named.to_string())
 }

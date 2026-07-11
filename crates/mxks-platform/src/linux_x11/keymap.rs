@@ -92,38 +92,55 @@ pub fn is_boundary(x_keycode: u8) -> bool {
     }
 }
 
-/// Map a canonical hotkey key name (see `mxks_core::hotkey`) to an X11 keycode.
-pub fn keycode_for_name(name: &str) -> Option<u8> {
-    let evdev = match name {
-        "PAUSE" => 119,
-        "SCROLLLOCK" => 70,
-        "INSERT" => 110,
-        "HOME" => 102,
-        "END" => 107,
-        "PAGEUP" => 104,
-        "PAGEDOWN" => 109,
-        "MENU" => 127,
-        "CAPSLOCK" => 58,
-        "SPACE" => 57,
-        "F1" => 59,
-        "F2" => 60,
-        "F3" => 61,
-        "F4" => 62,
-        "F5" => 63,
-        "F6" => 64,
-        "F7" => 65,
-        "F8" => 66,
-        "F9" => 67,
-        "F10" => 68,
-        "F11" => 87,
-        "F12" => 88,
-        // Single letters A-Z map through the layout table.
-        s if s.len() == 1 => {
-            let c = s.chars().next().unwrap().to_ascii_lowercase();
-            let key = mxks_core::layout::char_to_key(c, mxks_core::layout::Lang::En)?;
-            return Some(keycode_of(key));
-        }
+/// Canonical hotkey name for a letter key, derived layout-independently from the
+/// physical key (its English glyph, uppercased). `None` for non-letter keys.
+pub fn key_letter_name(x_keycode: u8) -> Option<String> {
+    let key = phys_of(x_keycode)?;
+    let c = mxks_core::layout::key_to_char(key, mxks_core::layout::Lang::En)?;
+    if c.is_ascii_alphabetic() {
+        Some(c.to_ascii_uppercase().to_string())
+    } else {
+        None
+    }
+}
+
+/// Canonical hotkey name for a named (non-letter) X keysym, if recognized.
+pub fn named_keysym(sym: u32) -> Option<&'static str> {
+    Some(match sym {
+        0xff13 | 0xff6b => "PAUSE",                          // Pause / Break
+        0xff14 => "SCROLLLOCK",                              // Scroll_Lock
+        0xff63 => "INSERT",                                  // Insert
+        0xff50 => "HOME",                                    // Home
+        0xff57 => "END",                                     // End
+        0xff55 => "PAGEUP",                                  // Prior
+        0xff56 => "PAGEDOWN",                                // Next
+        0xff67 => "MENU",                                    // Menu
+        0xffe5 => "CAPSLOCK",                                // Caps_Lock
+        0x0020 => "SPACE",                                   // space
+        0xffbe..=0xffc9 => return f_name(sym - 0xffbe + 1),  // F1..F12
+        0xffca..=0xffe0 => return f_name(sym - 0xffca + 13), // F13..
         _ => return None,
-    };
-    Some(evdev + X_OFFSET)
+    })
+}
+
+fn f_name(n: u32) -> Option<&'static str> {
+    Some(match n {
+        1 => "F1",
+        2 => "F2",
+        3 => "F3",
+        4 => "F4",
+        5 => "F5",
+        6 => "F6",
+        7 => "F7",
+        8 => "F8",
+        9 => "F9",
+        10 => "F10",
+        11 => "F11",
+        12 => "F12",
+        13 => "F13",
+        14 => "F14",
+        15 => "F15",
+        16 => "F16",
+        _ => return None,
+    })
 }

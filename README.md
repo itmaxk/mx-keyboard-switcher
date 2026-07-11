@@ -17,8 +17,10 @@ single binary per OS.
 
 - **Automatic wrong-layout correction** (on by default): `ghbdtn ` → `привет `.
 - **Manual conversion hotkey**: press **Pause/Break** to convert the current
-  word and switch layout. The hotkey is configurable.
-- **System tray**: enable/disable, toggle autocorrection, open/reload config.
+  word and switch layout. Reassign it from the tray (**Change hotkey → press a
+  key**) or in the config — matching is by key name, so any key or chord works.
+- **System tray**: enable/disable, toggle autocorrection, change the hotkey,
+  open/reload config.
 - **TOML config** with per-app and per-word exclusions and a custom dictionary.
 - **Privacy**: no network access at all; nothing leaves your machine.
 

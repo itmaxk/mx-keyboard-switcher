@@ -28,6 +28,80 @@ fn raw_tap(x_keycode: u8) {
     conn.flush().unwrap();
 }
 
+/// The default Pause hotkey must be recognized regardless of its keycode
+/// (110 here, 127 elsewhere) via keysym-name matching.
+#[test]
+#[ignore = "requires a live X server"]
+fn pause_triggers_hotkey() {
+    let Backend { mut capture, .. } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut saw_hotkey = false;
+    for _ in 0..30 {
+        raw_tap(110); // Pause on this server
+        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+            if ev.kind == KeyKind::Hotkey {
+                saw_hotkey = true;
+                break;
+            }
+        }
+        if saw_hotkey {
+            break;
+        }
+    }
+    assert!(saw_hotkey, "Pause did not fire the conversion hotkey");
+}
+
+/// "Press a key to assign" captures the pressed key, reports it, and then that
+/// key fires the hotkey.
+#[test]
+#[ignore = "requires a live X server"]
+fn capture_reassigns_hotkey() {
+    let Backend {
+        mut capture,
+        hotkey,
+        ..
+    } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Arm capture and press Scroll_Lock (keycode 78 on this server).
+    hotkey.begin_capture();
+    let mut assigned = None;
+    for _ in 0..30 {
+        raw_tap(78); // Scroll_Lock
+        if let Ok(spec) = hotkey.updates().recv_timeout(Duration::from_millis(100)) {
+            assigned = Some(spec);
+            break;
+        }
+    }
+    let spec = assigned.expect("capture did not report a hotkey");
+    assert_eq!(spec.key, "SCROLLLOCK");
+
+    // Now Scroll_Lock should fire the hotkey (no longer swallowed by capture).
+    let mut saw_hotkey = false;
+    for _ in 0..30 {
+        raw_tap(78);
+        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+            if ev.kind == KeyKind::Hotkey {
+                saw_hotkey = true;
+                break;
+            }
+        }
+        if saw_hotkey {
+            break;
+        }
+    }
+    assert!(saw_hotkey, "reassigned Scroll_Lock hotkey did not fire");
+}
+
 #[test]
 #[ignore = "requires a live X server with ru/us layouts"]
 fn layout_switch_round_trips() {
@@ -47,9 +121,9 @@ fn layout_switch_round_trips() {
 
 #[test]
 #[ignore = "requires a live X server"]
-fn backend_builds_and_finds_spare_keycode() {
-    // Just constructing the backend exercises spare-keycode discovery,
-    // XKB group detection, and connection setup.
+fn backend_builds() {
+    // Constructing the backend exercises connection setup, XKB group
+    // detection, and keymap loading.
     let _ = backend(HotkeySpec::default()).expect("backend builds");
 }
 
@@ -88,8 +162,8 @@ fn capture_reports_physical_key() {
     );
 }
 
-/// Our own injected input must be suppressed: the injector types through a
-/// spare keycode and tagged backspaces, and the capture thread must drop them.
+/// Our own injected input must be suppressed: the injector replays keycodes
+/// registered for suppression, and the capture thread must drop their echoes.
 #[test]
 #[ignore = "requires a live X server"]
 fn injected_input_is_suppressed() {

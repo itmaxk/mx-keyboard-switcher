@@ -7,8 +7,11 @@
 
 pub mod event;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use mxks_core::hotkey::HotkeySpec;
 use mxks_core::layout::Lang;
 
@@ -55,11 +58,74 @@ pub struct Backend {
     pub injector: Box<dyn KeyInjector>,
     pub layout: Box<dyn LayoutSwitcher>,
     pub focus: Box<dyn FocusInfo>,
+    /// Live control over the conversion hotkey (reassign at runtime).
+    pub hotkey: HotkeyHandle,
 }
 
-/// Build the backend for the current OS. The `hotkey` is watched by the capture
-/// backend so it can emit [`KeyKind::Hotkey`]. Returns an error describing why
-/// the platform is unsupported (e.g. a Wayland session on Linux).
+/// Shared with the capture backend: the current hotkey, a "capture the next key"
+/// flag, and a channel to report a newly captured hotkey back to the app.
+#[derive(Clone)]
+pub struct HotkeyControl {
+    spec: Arc<Mutex<HotkeySpec>>,
+    capturing: Arc<AtomicBool>,
+    updates: Sender<HotkeySpec>,
+}
+
+impl HotkeyControl {
+    /// The currently active hotkey.
+    pub fn current(&self) -> HotkeySpec {
+        self.spec.lock().unwrap().clone()
+    }
+    /// True while waiting to capture the next keypress as the new hotkey.
+    pub fn is_capturing(&self) -> bool {
+        self.capturing.load(Ordering::SeqCst)
+    }
+    /// Backend records a captured hotkey: update the live spec, stop capturing,
+    /// and report it so the app can persist it.
+    pub fn record(&self, spec: HotkeySpec) {
+        *self.spec.lock().unwrap() = spec.clone();
+        self.capturing.store(false, Ordering::SeqCst);
+        let _ = self.updates.send(spec);
+    }
+}
+
+/// App-side handle: start capture and receive the chosen hotkey.
+pub struct HotkeyHandle {
+    capturing: Arc<AtomicBool>,
+    updates: Receiver<HotkeySpec>,
+}
+
+impl HotkeyHandle {
+    /// Arm capture: the next keypress becomes the new hotkey.
+    pub fn begin_capture(&self) {
+        self.capturing.store(true, Ordering::SeqCst);
+    }
+    /// Channel of newly captured hotkeys (for the engine's select loop).
+    pub fn updates(&self) -> &Receiver<HotkeySpec> {
+        &self.updates
+    }
+}
+
+/// Create a linked control/handle pair seeded with `initial`.
+pub fn hotkey_channel(initial: HotkeySpec) -> (HotkeyControl, HotkeyHandle) {
+    let capturing = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    (
+        HotkeyControl {
+            spec: Arc::new(Mutex::new(initial)),
+            capturing: capturing.clone(),
+            updates: tx,
+        },
+        HotkeyHandle {
+            capturing,
+            updates: rx,
+        },
+    )
+}
+
+/// Build the backend for the current OS. The `hotkey` seeds the (reassignable)
+/// conversion hotkey. Returns an error describing why the platform is
+/// unsupported (e.g. a Wayland session on Linux).
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
     imp::backend(hotkey)
 }

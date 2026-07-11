@@ -27,6 +27,31 @@ impl Default for HotkeySpec {
     }
 }
 
+impl HotkeySpec {
+    /// Human-readable, re-parseable form, e.g. `"Ctrl+Shift+K"` or `"Pause"`.
+    pub fn display(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        if self.meta {
+            parts.push("Super");
+        }
+        let mut s = parts.join("+");
+        if !s.is_empty() {
+            s.push('+');
+        }
+        s.push_str(&self.key);
+        s
+    }
+}
+
 /// Parse a hotkey string. Components are separated by `+`; the last non-modifier
 /// component is the key. Returns `None` if there is no key component.
 pub fn parse(s: &str) -> Option<HotkeySpec> {

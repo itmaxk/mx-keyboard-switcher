@@ -60,42 +60,41 @@ pub fn is_boundary(keycode: u16) -> bool {
     BOUNDARIES.contains(&keycode)
 }
 
-/// Map a canonical hotkey name to a macOS virtual keycode. Note: Mac keyboards
-/// have no Pause/Break key, so the default "PAUSE" returns `None`; macOS users
-/// should configure a function key or a chord instead.
-pub fn keycode_for_name(name: &str) -> Option<u16> {
-    let kc = match name {
-        "F1" => 0x7A,
-        "F2" => 0x78,
-        "F3" => 0x63,
-        "F4" => 0x76,
-        "F5" => 0x60,
-        "F6" => 0x61,
-        "F7" => 0x62,
-        "F8" => 0x64,
-        "F9" => 0x65,
-        "F10" => 0x6D,
-        "F11" => 0x67,
-        "F12" => 0x6F,
-        "F13" => 0x69,
-        "F14" => 0x6B,
-        "F15" => 0x71,
-        "SPACE" => 0x31,
-        "HOME" => 0x73,
-        "END" => 0x77,
-        "PAGEUP" => 0x74,
-        "PAGEDOWN" => 0x79,
-        s if s.len() == 1 => {
-            let c = s.chars().next().unwrap().to_ascii_lowercase();
-            let key = mxks_core::layout::char_to_key(c, mxks_core::layout::Lang::En)?;
-            return phys_keycode(key);
-        }
-        _ => return None,
-    };
-    Some(kc)
+/// Canonical hotkey name for a letter key, from its keycode (layout-independent).
+pub fn key_letter_name(keycode: u16) -> Option<String> {
+    let key = phys_of(keycode)?;
+    let c = mxks_core::layout::key_to_char(key, mxks_core::layout::Lang::En)?;
+    if c.is_ascii_alphabetic() {
+        Some(c.to_ascii_uppercase().to_string())
+    } else {
+        None
+    }
 }
 
-/// Reverse lookup: macOS keycode for a tracked physical key.
-fn phys_keycode(key: PhysKey) -> Option<u16> {
-    LETTERS.iter().find(|(_, k)| *k == key).map(|(c, _)| *c)
+/// Canonical hotkey name for a named (non-letter) macOS keycode. Mac keyboards
+/// have no Pause/Break key, so function keys or chords are the practical choice.
+pub fn named_keycode(keycode: u16) -> Option<&'static str> {
+    Some(match keycode {
+        0x7A => "F1",
+        0x78 => "F2",
+        0x63 => "F3",
+        0x76 => "F4",
+        0x60 => "F5",
+        0x61 => "F6",
+        0x62 => "F7",
+        0x64 => "F8",
+        0x65 => "F9",
+        0x6D => "F10",
+        0x67 => "F11",
+        0x6F => "F12",
+        0x69 => "F13",
+        0x6B => "F14",
+        0x71 => "F15",
+        0x31 => "SPACE",
+        0x73 => "HOME",
+        0x77 => "END",
+        0x74 => "PAGEUP",
+        0x79 => "PAGEDOWN",
+        _ => return None,
+    })
 }

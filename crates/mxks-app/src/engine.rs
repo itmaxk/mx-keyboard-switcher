@@ -7,7 +7,7 @@ use mxks_core::config::Config;
 use mxks_core::convert::Stroke;
 use mxks_core::detect::{analyze, Params, Verdict};
 use mxks_core::layout::Lang;
-use mxks_platform::{FocusInfo, KeyEvent, KeyKind};
+use mxks_platform::{FocusInfo, HotkeyHandle, KeyEvent, KeyKind};
 
 use crate::corrector::Corrector;
 
@@ -25,6 +25,8 @@ pub enum Command {
     OpenConfig,
     /// Reload config from disk (does not change the capture hotkey).
     ReloadConfig,
+    /// Arm "press a key" capture to reassign the conversion hotkey.
+    SetHotkey,
     /// Quit the application.
     Quit,
 }
@@ -32,10 +34,14 @@ pub enum Command {
 /// Snapshot of engine state the tray can render.
 // Fields are read only by the tray, which is compiled out on some builds.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Status {
     pub enabled: bool,
     pub autocorrect: bool,
+    /// Current conversion hotkey, human-readable (e.g. "Pause", "Ctrl+Shift+K").
+    pub hotkey: String,
+    /// True while waiting for the user to press a key to assign.
+    pub capturing: bool,
 }
 
 pub struct Engine {
@@ -43,8 +49,10 @@ pub struct Engine {
     config: Config,
     corrector: Corrector,
     focus: Box<dyn FocusInfo>,
+    hotkey: HotkeyHandle,
     active: Lang,
     enabled: bool,
+    capturing: bool,
     /// Last completed word + its trailing separator, for the manual hotkey.
     last: Option<(Word, String)>,
     /// Broadcasts status changes so the tray can update its menu.
@@ -52,15 +60,22 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(config: Config, corrector: Corrector, focus: Box<dyn FocusInfo>) -> Self {
+    pub fn new(
+        config: Config,
+        corrector: Corrector,
+        focus: Box<dyn FocusInfo>,
+        hotkey: HotkeyHandle,
+    ) -> Self {
         let active = corrector.current_layout().unwrap_or(Lang::En);
         Engine {
             buffer: WordBuffer::new(active),
             config,
             corrector,
             focus,
+            hotkey,
             active,
             enabled: true,
+            capturing: false,
             last: None,
             status_tx: None,
         }
@@ -75,6 +90,8 @@ impl Engine {
         Status {
             enabled: self.enabled,
             autocorrect: self.config.general.autocorrect,
+            hotkey: self.config.hotkeys.convert_last_word.clone(),
+            capturing: self.capturing,
         }
     }
 
@@ -87,6 +104,7 @@ impl Engine {
     /// Main loop. Returns when either channel closes or `Quit` is received.
     pub fn run(&mut self, key_rx: Receiver<KeyEvent>, cmd_rx: Receiver<Command>) {
         self.broadcast_status();
+        let hk_rx = self.hotkey.updates().clone();
         loop {
             crossbeam_channel::select! {
                 recv(key_rx) -> msg => match msg {
@@ -98,8 +116,25 @@ impl Engine {
                         if self.handle_command(cmd) { break; }
                     }
                 },
+                recv(hk_rx) -> msg => {
+                    if let Ok(spec) = msg {
+                        self.on_hotkey_assigned(spec);
+                    }
+                },
             }
         }
+    }
+
+    /// A new hotkey was captured: persist it and update state.
+    fn on_hotkey_assigned(&mut self, spec: mxks_core::hotkey::HotkeySpec) {
+        let shown = spec.display();
+        self.config.hotkeys.convert_last_word = shown.clone();
+        self.capturing = false;
+        if let Err(e) = crate::config_io::save_hotkey(&shown) {
+            tracing::warn!("could not save hotkey: {e:#}");
+        }
+        tracing::info!("conversion hotkey set to {shown}");
+        self.broadcast_status();
     }
 
     fn handle_key(&mut self, ev: KeyEvent) {
@@ -224,6 +259,12 @@ impl Engine {
                     crate::open_path(&path);
                 }
             }
+            Command::SetHotkey => {
+                self.capturing = true;
+                self.hotkey.begin_capture();
+                tracing::info!("press a key (optionally with modifiers) to set the hotkey");
+                self.broadcast_status();
+            }
             Command::Quit => return true,
         }
         false
@@ -329,7 +370,9 @@ mod tests {
                 current: Lang::En,
             }),
         );
-        let mut engine = Engine::new(Config::default(), corrector, Box::new(MockFocus));
+        let (_hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        let mut engine = Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle);
 
         let (key_tx, key_rx) = crossbeam_channel::unbounded();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
@@ -371,7 +414,9 @@ mod tests {
                 current: Lang::En,
             }),
         );
-        let mut engine = Engine::new(Config::default(), corrector, Box::new(MockFocus));
+        let (_hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        let mut engine = Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle);
 
         let (key_tx, key_rx) = crossbeam_channel::unbounded();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();

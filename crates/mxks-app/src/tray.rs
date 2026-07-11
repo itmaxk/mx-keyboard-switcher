@@ -60,6 +60,20 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
                 .into(),
                 MenuItem::Separator,
                 StandardItem {
+                    label: if self.status.capturing {
+                        "Press a key…".into()
+                    } else {
+                        format!("Change hotkey (now: {})", self.status.hotkey)
+                    },
+                    enabled: !self.status.capturing,
+                    activate: Box::new(|t: &mut AppTray| {
+                        let _ = t.cmd_tx.send(Command::SetHotkey);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                StandardItem {
                     label: "Open config file".into(),
                     activate: Box::new(|t: &mut AppTray| {
                         let _ = t.cmd_tx.send(Command::OpenConfig);
@@ -93,6 +107,8 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
         status: Status {
             enabled: true,
             autocorrect: true,
+            hotkey: "Pause".into(),
+            capturing: false,
         },
     };
     let handle = match tray.spawn() {

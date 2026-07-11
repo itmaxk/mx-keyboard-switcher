@@ -19,11 +19,13 @@ use crate::{Backend, FocusInfo};
 pub const MAGIC: i64 = 0x4B42_5357; // "KBSW"
 
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
+    let (control, handle) = crate::hotkey_channel(hotkey);
     Ok(Backend {
-        capture: Box::new(tap::MacCapture::new(hotkey)),
+        capture: Box::new(tap::MacCapture::new(control)),
         injector: Box::new(inject::MacInjector::new()?),
         layout: Box::new(layout::MacLayout),
         focus: Box::new(MacFocus),
+        hotkey: handle,
     })
 }
 

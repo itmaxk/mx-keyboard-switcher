@@ -6,6 +6,7 @@
 
 use std::sync::OnceLock;
 
+use crate::HotkeyControl;
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use mxks_core::hotkey::HotkeySpec;
@@ -31,18 +32,17 @@ const VK_RWIN: i32 = 0x5C;
 
 struct Shared {
     tx: Sender<KeyEvent>,
-    hotkey_vk: Option<u16>,
-    hotkey: HotkeySpec,
+    hotkey: HotkeyControl,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
 
 pub struct WinCapture {
-    hotkey: HotkeySpec,
+    hotkey: HotkeyControl,
 }
 
 impl WinCapture {
-    pub fn new(hotkey: HotkeySpec) -> Self {
+    pub fn new(hotkey: HotkeyControl) -> Self {
         WinCapture { hotkey }
     }
 }
@@ -51,30 +51,73 @@ fn key_down(vk: i32) -> bool {
     (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
 }
 
-fn classify(shared: &Shared, kb: &KBDLLHOOKSTRUCT) -> Option<KeyKind> {
+struct Mods {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+}
+
+fn current_mods() -> Mods {
+    Mods {
+        shift: key_down(VK_SHIFT),
+        ctrl: key_down(VK_CONTROL),
+        alt: key_down(VK_MENU),
+        meta: key_down(VK_LWIN) || key_down(VK_RWIN),
+    }
+}
+
+/// Canonical hotkey name for a key: letters via scan code, named keys via VK.
+fn name_of(kb: &KBDLLHOOKSTRUCT) -> Option<String> {
+    if let Some(name) = keymap::key_letter_name(kb.scanCode) {
+        return Some(name);
+    }
+    keymap::vk_name(kb.vkCode as u16)
+}
+
+fn capture_spec(kb: &KBDLLHOOKSTRUCT, m: &Mods) -> Option<HotkeySpec> {
+    let name = name_of(kb)?;
+    let has_mod = m.ctrl || m.alt || m.meta;
+    if name.len() == 1 && !has_mod {
+        return None; // avoid a bare-letter hotkey
+    }
+    Some(HotkeySpec {
+        ctrl: m.ctrl,
+        shift: m.shift,
+        alt: m.alt,
+        meta: m.meta,
+        key: name,
+    })
+}
+
+fn matches_hotkey(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> bool {
+    let spec = shared.hotkey.current();
+    match name_of(kb) {
+        Some(name) => {
+            name.eq_ignore_ascii_case(&spec.key)
+                && m.ctrl == spec.ctrl
+                && m.shift == spec.shift
+                && m.alt == spec.alt
+                && m.meta == spec.meta
+        }
+        None => false,
+    }
+}
+
+fn classify(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> Option<KeyKind> {
     let scan = kb.scanCode;
-    let vk = kb.vkCode as u16;
 
-    let shift = key_down(VK_SHIFT);
-    let ctrl = key_down(VK_CONTROL);
-    let alt = key_down(VK_MENU);
-    let meta = key_down(VK_LWIN) || key_down(VK_RWIN);
-
-    if Some(vk) == shared.hotkey_vk
-        && ctrl == shared.hotkey.ctrl
-        && shift == shared.hotkey.shift
-        && alt == shared.hotkey.alt
-        && meta == shared.hotkey.meta
-    {
+    if matches_hotkey(shared, kb, m) {
         return Some(KeyKind::Hotkey);
     }
-
-    if ctrl || alt || meta {
+    if m.ctrl || m.alt || m.meta {
         return Some(KeyKind::Reset);
     }
-
     if let Some(key) = keymap::phys_of(scan) {
-        return Some(KeyKind::Letter { key, shift });
+        return Some(KeyKind::Letter {
+            key,
+            shift: m.shift,
+        });
     }
     if scan == keymap::SC_BACKSPACE {
         return Some(KeyKind::Backspace);
@@ -96,7 +139,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let msg = wparam.0 as u32;
             if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                 if let Some(shared) = SHARED.get() {
-                    if let Some(kind) = classify(shared, kb) {
+                    let m = current_mods();
+                    if shared.hotkey.is_capturing() {
+                        if let Some(spec) = capture_spec(kb, &m) {
+                            shared.hotkey.record(spec);
+                        }
+                    } else if let Some(kind) = classify(shared, kb, &m) {
                         let _ = shared.tx.send(KeyEvent {
                             kind,
                             down: true,
@@ -112,10 +160,8 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
 
 impl crate::KeyCapture for WinCapture {
     fn run(&mut self, tx: Sender<KeyEvent>) -> Result<()> {
-        let hotkey_vk = keymap::vk_for_name(&self.hotkey.key);
         let _ = SHARED.set(Shared {
             tx,
-            hotkey_vk,
             hotkey: self.hotkey.clone(),
         });
 

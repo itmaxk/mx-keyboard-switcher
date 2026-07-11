@@ -22,6 +22,34 @@ pub fn load() -> Config {
     }
 }
 
+/// Persist a new conversion hotkey into the config file, preserving comments by
+/// replacing just the `convert_last_word` line.
+pub fn save_hotkey(display: &str) -> Result<()> {
+    let path = config_path()?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_TEMPLATE.to_string());
+
+    let mut out = String::new();
+    let mut replaced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("convert_last_word") {
+            out.push_str(&format!("convert_last_word = \"{display}\"\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !replaced {
+        out.push_str(&format!("\n[hotkeys]\nconvert_last_word = \"{display}\"\n"));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 fn load_inner() -> Result<Config> {
     let path = config_path()?;
     if !path.exists() {

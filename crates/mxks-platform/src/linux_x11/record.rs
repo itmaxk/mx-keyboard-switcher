@@ -4,18 +4,25 @@
 //! one to stream data. The stream is a blocking iterator, so this owns the
 //! capture thread. Each 32-byte core event is parsed for its keycode and
 //! modifier state; injected events are filtered out via [`Suppress`].
+//!
+//! The conversion hotkey is matched by *key name* (resolved from the keycode:
+//! letters via the physical key, named keys via their keysym), which is robust
+//! across keymaps — unlike hard-coded keycodes, where e.g. Pause is 110 on one
+//! machine and 127 on another. The same resolution powers "press a key to
+//! assign" capture mode.
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
-use mxks_core::hotkey::HotkeySpec;
 use x11rb::connection::Connection;
 use x11rb::protocol::record::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
+use x11rb::protocol::xproto::{ConnectionExt as _, KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
 use x11rb::rust_connection::RustConnection;
 
 use super::keymap::{self, KC_BACKSPACE};
 use super::suppress::Suppress;
 use crate::event::{KeyEvent, KeyKind};
+use crate::HotkeyControl;
+use mxks_core::hotkey::HotkeySpec;
 
 /// RECORD reply category for data coming from the server.
 const FROM_SERVER: u8 = 0;
@@ -28,55 +35,129 @@ const SUPER: u16 = 1 << 6; // Mod4
 
 pub struct X11Capture {
     suppress: Suppress,
-    hotkey_keycode: Option<u8>,
-    hotkey: HotkeySpec,
+    hotkey: HotkeyControl,
+    /// Cached keymap for keycode → keysym resolution (named keys only; stable).
+    keysyms: Vec<u32>,
+    per: usize,
+    min_keycode: u8,
+}
+
+struct Mods {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
 }
 
 impl X11Capture {
-    pub fn new(suppress: Suppress, hotkey: HotkeySpec) -> Self {
-        let hotkey_keycode = keymap::keycode_for_name(&hotkey.key);
+    pub fn new(suppress: Suppress, hotkey: HotkeyControl) -> Self {
         X11Capture {
             suppress,
-            hotkey_keycode,
             hotkey,
+            keysyms: Vec::new(),
+            per: 0,
+            min_keycode: 8,
+        }
+    }
+
+    fn load_keymap(&mut self) -> Result<()> {
+        let (conn, _) = RustConnection::connect(None)?;
+        let setup = conn.setup();
+        self.min_keycode = setup.min_keycode;
+        let count = setup.max_keycode - setup.min_keycode + 1;
+        let map = conn
+            .get_keyboard_mapping(setup.min_keycode, count)?
+            .reply()?;
+        self.per = map.keysyms_per_keycode as usize;
+        self.keysyms = map.keysyms;
+        Ok(())
+    }
+
+    /// Canonical hotkey name for a keycode: letters via the physical key,
+    /// otherwise a recognized named keysym.
+    fn name_of(&self, keycode: u8) -> Option<String> {
+        if let Some(name) = keymap::key_letter_name(keycode) {
+            return Some(name);
+        }
+        if self.per > 0 && keycode >= self.min_keycode {
+            let base = (keycode - self.min_keycode) as usize * self.per;
+            for off in 0..self.per {
+                if let Some(&sym) = self.keysyms.get(base + off) {
+                    if let Some(name) = keymap::named_keysym(sym) {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn mods(state: u16) -> Mods {
+        Mods {
+            shift: state & SHIFT != 0,
+            ctrl: state & CONTROL != 0,
+            alt: state & ALT != 0,
+            meta: state & SUPER != 0,
+        }
+    }
+
+    /// Build a HotkeySpec for a captured key, if it is a sensible hotkey (a
+    /// named key, or any key combined with a modifier — never a bare letter).
+    fn capture_spec(&self, keycode: u8, m: &Mods) -> Option<HotkeySpec> {
+        let name = self.name_of(keycode)?;
+        let has_mod = m.ctrl || m.alt || m.meta;
+        let is_bare_letter = name.len() == 1 && !has_mod;
+        if is_bare_letter {
+            return None; // avoid footgun: a plain letter as the hotkey
+        }
+        Some(HotkeySpec {
+            ctrl: m.ctrl,
+            shift: m.shift,
+            alt: m.alt,
+            meta: m.meta,
+            key: name,
+        })
+    }
+
+    fn matches_hotkey(&self, keycode: u8, m: &Mods) -> bool {
+        let spec = self.hotkey.current();
+        match self.name_of(keycode) {
+            Some(name) => {
+                name.eq_ignore_ascii_case(&spec.key)
+                    && m.ctrl == spec.ctrl
+                    && m.shift == spec.shift
+                    && m.alt == spec.alt
+                    && m.meta == spec.meta
+            }
+            None => false,
         }
     }
 
     fn classify(&self, keycode: u8, state: u16) -> Option<KeyKind> {
-        let shift = state & SHIFT != 0;
-        let ctrl = state & CONTROL != 0;
-        let alt = state & ALT != 0;
-        let meta = state & SUPER != 0;
+        let m = Self::mods(state);
 
-        // Hotkey has priority over everything else.
-        if Some(keycode) == self.hotkey_keycode
-            && ctrl == self.hotkey.ctrl
-            && shift == self.hotkey.shift
-            && alt == self.hotkey.alt
-            && meta == self.hotkey.meta
-        {
+        if self.matches_hotkey(keycode, &m) {
             return Some(KeyKind::Hotkey);
         }
 
-        // Any control/alt/super chord invalidates the word buffer.
-        if ctrl || alt || meta {
+        if m.ctrl || m.alt || m.meta {
             return Some(KeyKind::Reset);
         }
-
         if let Some(key) = keymap::phys_of(keycode) {
-            return Some(KeyKind::Letter { key, shift });
+            return Some(KeyKind::Letter {
+                key,
+                shift: m.shift,
+            });
         }
         if keycode == KC_BACKSPACE {
             return Some(KeyKind::Backspace);
         }
         if keycode == keymap::KC_SPACE {
-            // Only Space triggers autocorrection in v1; re-typed after a fix.
             return Some(KeyKind::Boundary { sep: Some(' ') });
         }
         if keymap::is_boundary(keycode) {
             return Some(KeyKind::Boundary { sep: None });
         }
-        // Esc, arrows, function keys, etc.
         Some(KeyKind::Reset)
     }
 
@@ -84,8 +165,7 @@ impl X11Capture {
     fn on_event(&self, data: &[u8], tx: &Sender<KeyEvent>) -> Result<()> {
         let response_type = data[0] & 0x7f;
         if response_type != KEY_PRESS_EVENT {
-            // We act only on key-down; ignore key-up (KEY_RELEASE_EVENT).
-            let _ = KEY_RELEASE_EVENT;
+            let _ = KEY_RELEASE_EVENT; // we act only on key-down
             return Ok(());
         }
         let keycode = data[1];
@@ -93,6 +173,15 @@ impl X11Capture {
 
         if self.suppress.should_drop(keycode) {
             return Ok(());
+        }
+
+        // Capture mode: record the next sensible key as the new hotkey.
+        if self.hotkey.is_capturing() {
+            let m = Self::mods(state);
+            if let Some(spec) = self.capture_spec(keycode, &m) {
+                self.hotkey.record(spec);
+            }
+            return Ok(()); // swallow while capturing
         }
 
         if let Some(kind) = self.classify(keycode, state) {
@@ -108,6 +197,9 @@ impl X11Capture {
 
 impl crate::KeyCapture for X11Capture {
     fn run(&mut self, tx: Sender<KeyEvent>) -> Result<()> {
+        self.load_keymap()
+            .context("loading keymap for hotkey names")?;
+
         let (ctrl_conn, _) = RustConnection::connect(None).context("RECORD control connection")?;
         let (data_conn, _) = RustConnection::connect(None).context("RECORD data connection")?;
 

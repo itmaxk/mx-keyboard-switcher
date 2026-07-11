@@ -14,41 +14,83 @@ use mxks_core::hotkey::HotkeySpec;
 use super::keymap;
 use super::MAGIC;
 use crate::event::{KeyEvent, KeyKind};
+use crate::HotkeyControl;
 
 pub struct MacCapture {
-    hotkey: HotkeySpec,
+    hotkey: HotkeyControl,
 }
 
 impl MacCapture {
-    pub fn new(hotkey: HotkeySpec) -> Self {
+    pub fn new(hotkey: HotkeyControl) -> Self {
         MacCapture { hotkey }
     }
 }
 
-fn classify(
-    keycode: u16,
-    flags: CGEventFlags,
-    hotkey_kc: Option<u16>,
-    hotkey: &HotkeySpec,
-) -> Option<KeyKind> {
-    let shift = flags.contains(CGEventFlags::CGEventFlagShift);
-    let ctrl = flags.contains(CGEventFlags::CGEventFlagControl);
-    let alt = flags.contains(CGEventFlags::CGEventFlagAlternate);
-    let meta = flags.contains(CGEventFlags::CGEventFlagCommand);
+struct Mods {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+}
 
-    if Some(keycode) == hotkey_kc
-        && ctrl == hotkey.ctrl
-        && shift == hotkey.shift
-        && alt == hotkey.alt
-        && meta == hotkey.meta
-    {
+fn mods(flags: CGEventFlags) -> Mods {
+    Mods {
+        shift: flags.contains(CGEventFlags::CGEventFlagShift),
+        ctrl: flags.contains(CGEventFlags::CGEventFlagControl),
+        alt: flags.contains(CGEventFlags::CGEventFlagAlternate),
+        meta: flags.contains(CGEventFlags::CGEventFlagCommand),
+    }
+}
+
+/// Canonical hotkey name for a keycode: letters via the physical key, otherwise
+/// a recognized named keycode.
+fn name_of(keycode: u16) -> Option<String> {
+    if let Some(name) = keymap::key_letter_name(keycode) {
+        return Some(name);
+    }
+    keymap::named_keycode(keycode).map(|s| s.to_string())
+}
+
+fn capture_spec(keycode: u16, m: &Mods) -> Option<HotkeySpec> {
+    let name = name_of(keycode)?;
+    let has_mod = m.ctrl || m.alt || m.meta;
+    if name.len() == 1 && !has_mod {
+        return None; // avoid a bare-letter hotkey
+    }
+    Some(HotkeySpec {
+        ctrl: m.ctrl,
+        shift: m.shift,
+        alt: m.alt,
+        meta: m.meta,
+        key: name,
+    })
+}
+
+fn matches_hotkey(keycode: u16, m: &Mods, spec: &HotkeySpec) -> bool {
+    match name_of(keycode) {
+        Some(name) => {
+            name.eq_ignore_ascii_case(&spec.key)
+                && m.ctrl == spec.ctrl
+                && m.shift == spec.shift
+                && m.alt == spec.alt
+                && m.meta == spec.meta
+        }
+        None => false,
+    }
+}
+
+fn classify(keycode: u16, m: &Mods, spec: &HotkeySpec) -> Option<KeyKind> {
+    if matches_hotkey(keycode, m, spec) {
         return Some(KeyKind::Hotkey);
     }
-    if ctrl || alt || meta {
+    if m.ctrl || m.alt || m.meta {
         return Some(KeyKind::Reset);
     }
     if let Some(key) = keymap::phys_of(keycode) {
-        return Some(KeyKind::Letter { key, shift });
+        return Some(KeyKind::Letter {
+            key,
+            shift: m.shift,
+        });
     }
     if keycode == keymap::KC_DELETE {
         return Some(KeyKind::Backspace);
@@ -65,7 +107,6 @@ fn classify(
 impl crate::KeyCapture for MacCapture {
     fn run(&mut self, tx: Sender<KeyEvent>) -> Result<()> {
         let hotkey = self.hotkey.clone();
-        let hotkey_kc = keymap::keycode_for_name(&hotkey.key);
 
         let tap = CGEventTap::new(
             CGEventTapLocation::HID,
@@ -78,7 +119,12 @@ impl crate::KeyCapture for MacCapture {
                 {
                     let keycode =
                         event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                    if let Some(kind) = classify(keycode, event.get_flags(), hotkey_kc, &hotkey) {
+                    let m = mods(event.get_flags());
+                    if hotkey.is_capturing() {
+                        if let Some(spec) = capture_spec(keycode, &m) {
+                            hotkey.record(spec);
+                        }
+                    } else if let Some(kind) = classify(keycode, &m, &hotkey.current()) {
                         let _ = tx.send(KeyEvent {
                             kind,
                             down: true,
