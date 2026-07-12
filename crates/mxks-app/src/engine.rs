@@ -37,6 +37,18 @@ pub enum Command {
     Quit,
 }
 
+/// How the switcher behaves in the focused application (see `[exclusions]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppMode {
+    /// Automatic correction + suggestions and the manual hotkey all work.
+    Full,
+    /// Automatic correction and suggestions are suppressed, but the manual
+    /// conversion hotkey still works on demand (terminals).
+    ManualOnly,
+    /// The switcher does nothing here, not even the hotkey (password managers).
+    Off,
+}
+
 /// Snapshot of engine state the tray can render.
 // Fields are read only by the tray, which is compiled out on some builds.
 #[allow(dead_code)]
@@ -281,7 +293,8 @@ impl Engine {
         if prefix_len < ac.min_prefix {
             return None;
         }
-        if self.app_excluded() {
+        // Suggestions are automatic, so only in fully-enabled apps.
+        if self.app_mode() != AppMode::Full {
             return None;
         }
         let full = mxks_core::dict::complete(&prefix, word.lang)?;
@@ -374,7 +387,17 @@ impl Engine {
         if sep.is_none() {
             return;
         }
-        if self.app_excluded() {
+        // Automatic correction runs only in fully-enabled apps.
+        if self.app_mode() != AppMode::Full {
+            return;
+        }
+        // Skip mixed-case identifiers (camelCase/PascalCase like "myVar",
+        // "GitHub"): an interior capital marks a code token, not prose, so
+        // auto-correcting it is almost always wrong. All-caps and a lone leading
+        // capital are left alone by this check and still correct normally.
+        let interior_upper = word.keys.iter().skip(1).any(|s| s.shift);
+        let has_lower = word.keys.iter().any(|s| !s.shift);
+        if interior_upper && has_lower {
             return;
         }
 
@@ -411,6 +434,12 @@ impl Engine {
     /// toggles the same word back and forth.
     fn manual_convert(&mut self) {
         if !self.enabled {
+            return;
+        }
+        // The hotkey is on-demand, so it works everywhere except hard-off apps
+        // (password managers). It intentionally still works in manual-only apps
+        // like terminals.
+        if self.app_mode() == AppMode::Off {
             return;
         }
 
@@ -519,18 +548,26 @@ impl Engine {
         false
     }
 
-    fn app_excluded(&self) -> bool {
-        if self.config.exclusions.apps.is_empty() {
-            return false;
+    /// How the switcher should behave in the currently focused application.
+    fn app_mode(&self) -> AppMode {
+        let ex = &self.config.exclusions;
+        if ex.apps.is_empty() && ex.manual_only.is_empty() {
+            return AppMode::Full;
         }
-        match self.focus.focused_app() {
-            Some(app) => self
-                .config
-                .exclusions
-                .apps
-                .iter()
-                .any(|ex| !ex.is_empty() && app.contains(&ex.to_lowercase())),
-            None => false,
+        let Some(app) = self.focus.focused_app() else {
+            return AppMode::Full;
+        };
+        let matches = |list: &[String]| {
+            list.iter()
+                .any(|e| !e.is_empty() && app.contains(&e.to_lowercase()))
+        };
+        // A hard exclusion (Off) wins over a soft one (ManualOnly).
+        if matches(&ex.apps) {
+            AppMode::Off
+        } else if matches(&ex.manual_only) {
+            AppMode::ManualOnly
+        } else {
+            AppMode::Full
         }
     }
 
@@ -598,9 +635,25 @@ mod tests {
     struct MockFocus;
     impl FocusInfo for MockFocus {}
 
+    /// Focus mock that reports a fixed application name (as `focused_app` would
+    /// return a lowercased WM_CLASS), to exercise the per-app modes.
+    struct MockFocusApp(String);
+    impl FocusInfo for MockFocusApp {
+        fn focused_app(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
     fn letter(key: PhysKey) -> KeyEvent {
         KeyEvent {
             kind: KeyKind::Letter { key, shift: false },
+            down: true,
+            injected: false,
+        }
+    }
+    fn letter_shift(key: PhysKey) -> KeyEvent {
+        KeyEvent {
+            kind: KeyKind::Letter { key, shift: true },
             down: true,
             injected: false,
         }
@@ -727,6 +780,149 @@ mod tests {
                 Op::Type("привет".to_string()),
                 Op::Type(" ".to_string()),
             ]
+        );
+    }
+
+    /// Build an engine whose focus reports `app`, with a custom config, for the
+    /// per-app mode tests. Returns the hotkey control side too so the caller
+    /// keeps it alive (a dropped control disconnects the updates channel and
+    /// makes `run`'s select! busy-spin).
+    fn mode_engine(config: Config, app: &str, log: Log) -> (Engine, mxks_platform::HotkeyControl) {
+        let corrector = Corrector::new(
+            Box::new(MockInjector(log.clone())),
+            Box::new(MockLayout {
+                log,
+                current: Arc::new(Mutex::new(Lang::En)),
+            }),
+        );
+        let (hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        let engine = Engine::new(
+            config,
+            corrector,
+            Box::new(MockFocusApp(app.into())),
+            hk_handle,
+        );
+        (engine, hk_ctrl)
+    }
+
+    /// The exact op sequence a manual `ghbdtn ` -> `привет` conversion produces.
+    fn expected_ghbdtn_convert() -> Vec<Op> {
+        vec![
+            Op::Backspaces(7),
+            Op::Switch(Lang::Ru),
+            Op::Type("привет".to_string()),
+            Op::Type(" ".to_string()),
+        ]
+    }
+
+    fn ghbdtn() -> [KeyEvent; 6] {
+        [
+            letter(PhysKey::G),
+            letter(PhysKey::H),
+            letter(PhysKey::B),
+            letter(PhysKey::D),
+            letter(PhysKey::T),
+            letter(PhysKey::N),
+        ]
+    }
+
+    /// A manual-only app (terminal): a Space boundary must NOT auto-correct, but
+    /// the conversion hotkey still converts on demand.
+    #[test]
+    fn manual_only_app_skips_auto_but_allows_hotkey() {
+        let mut config = Config::default();
+        config.exclusions.manual_only = vec!["ptyxis".into()];
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _hk) = mode_engine(config, "ptyxis ptyxis", log.clone());
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        for ev in ghbdtn() {
+            key_tx.send(ev).unwrap();
+        }
+        key_tx.send(space()).unwrap(); // must NOT auto-correct here
+        key_tx.send(hotkey()).unwrap(); // manual convert must still work
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            expected_ghbdtn_convert(),
+            "manual-only app auto-corrected (should only convert on the hotkey)"
+        );
+    }
+
+    /// A hard-excluded app (password manager): nothing runs, not even the
+    /// conversion hotkey.
+    #[test]
+    fn hard_excluded_app_blocks_even_hotkey() {
+        let mut config = Config::default();
+        config.exclusions.apps = vec!["keepassxc".into()];
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _hk) = mode_engine(config, "keepassxc keepassxc", log.clone());
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        for ev in ghbdtn() {
+            key_tx.send(ev).unwrap();
+        }
+        key_tx.send(space()).unwrap();
+        key_tx.send(hotkey()).unwrap();
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "hard-excluded app must not convert, even via the hotkey"
+        );
+    }
+
+    /// A full (unlisted) app still auto-corrects at a Space boundary.
+    #[test]
+    fn full_app_autocorrects() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _hk) = mode_engine(Config::default(), "org.some.editor", log.clone());
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        for ev in ghbdtn() {
+            key_tx.send(ev).unwrap();
+        }
+        key_tx.send(space()).unwrap();
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        assert_eq!(log.lock().unwrap().clone(), expected_ghbdtn_convert());
+    }
+
+    /// A mixed-case identifier (interior capital) must not be auto-corrected,
+    /// even in a full app: "ghBdtn" would otherwise convert like "ghbdtn".
+    #[test]
+    fn mixed_case_identifier_is_not_autocorrected() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _hk) = mode_engine(Config::default(), "org.some.editor", log.clone());
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        // g h B d t n  (interior capital B) + space
+        for ev in [
+            letter(PhysKey::G),
+            letter(PhysKey::H),
+            letter_shift(PhysKey::B),
+            letter(PhysKey::D),
+            letter(PhysKey::T),
+            letter(PhysKey::N),
+        ] {
+            key_tx.send(ev).unwrap();
+        }
+        key_tx.send(space()).unwrap();
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "mixed-case identifier was auto-corrected"
         );
     }
 

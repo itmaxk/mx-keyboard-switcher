@@ -42,8 +42,14 @@ pub struct Detection {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Exclusions {
-    /// Process/app-name substrings where autocorrection is disabled.
+    /// App-name substrings where the switcher is fully off — no automatic
+    /// correction/suggestions AND no manual hotkey conversion (e.g. password
+    /// managers).
     pub apps: Vec<String>,
+    /// App-name substrings where automatic correction and suggestions are off
+    /// but the manual conversion hotkey still works on demand (e.g. terminals,
+    /// where shell commands must not be auto-rewritten).
+    pub manual_only: Vec<String>,
     /// Typed forms that must never be auto-corrected.
     pub words: Vec<String>,
 }
@@ -130,8 +136,14 @@ convert_last_word = "Pause"
 threshold = 3.0
 
 [exclusions]
-# Substrings of application/process names where autocorrection is disabled.
+# App-name substrings (WM_CLASS, lowercased) where the switcher is FULLY off —
+# no automatic correction/suggestions and no manual hotkey (password managers).
 apps = ["keepassxc", "1password", "bitwarden"]
+# App-name substrings where AUTOMATIC correction and suggestions are off but the
+# manual conversion hotkey still works on demand. Terminals live here because
+# shell commands are not dictionary words: auto-"correcting" them rewrites your
+# command line (and leaves the system layout switched to Russian).
+manual_only = ["ptyxis", "gnome-terminal", "konsole", "xterm", "alacritty", "kitty", "terminator", "xfce4-terminal", "tilix", "wezterm"]
 # Typed forms that must never be auto-corrected.
 words = []
 
@@ -174,9 +186,17 @@ mod tests {
         let c = Config::from_toml(DEFAULT_TEMPLATE).unwrap();
         assert_eq!(c.detection.threshold, 3.0);
         assert!(c.exclusions.apps.iter().any(|a| a == "keepassxc"));
+        assert!(c.exclusions.manual_only.iter().any(|a| a == "ptyxis"));
         assert!(c.autocomplete.enabled);
         assert_eq!(c.autocomplete.accept_key, "Tab");
         assert_eq!(c.autocomplete.min_prefix, 3);
+    }
+
+    #[test]
+    fn manual_only_defaults_empty_when_absent() {
+        // A config without the new key still loads (empty list, not an error).
+        let c = Config::from_toml("[exclusions]\napps = [\"keepassxc\"]\n").unwrap();
+        assert!(c.exclusions.manual_only.is_empty());
     }
 
     #[test]
