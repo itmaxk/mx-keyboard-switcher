@@ -45,12 +45,28 @@ fn raw_key(x_keycode: u8, press: bool) {
     conn.flush().unwrap();
 }
 
+/// These tests inject raw XTEST events that the X server delivers to whatever
+/// window currently has focus. On a shared desktop display that means phantom
+/// Shift+Tab / Ctrl+C / letters landing in the user's terminals. Refuse to run
+/// unless `MXKS_TEST_DISPLAY` (exported by `scripts/run-x11-live-tests.sh`)
+/// names the isolated display we are connected to.
+fn require_isolated_display() {
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    let allowed = std::env::var("MXKS_TEST_DISPLAY").unwrap_or_default();
+    assert!(
+        !allowed.is_empty() && display == allowed,
+        "x11_live tests inject keystrokes into the focused window; run them only \
+         via scripts/run-x11-live-tests.sh (DISPLAY={display:?}, MXKS_TEST_DISPLAY={allowed:?})"
+    );
+}
+
 /// Reproduce the phantom Control that real Pause keys emit (scancode carries a
 /// Ctrl prefix): Control held while Pause is pressed must still fire the hotkey,
 /// and the Control key must not surface as a buffer-resetting event.
 #[test]
 #[ignore = "requires a live X server"]
 fn pause_with_phantom_control_fires() {
+    require_isolated_display();
     let Backend { mut capture, .. } = backend(HotkeySpec::default()).expect("backend");
     let (tx, rx) = crossbeam_channel::unbounded();
     std::thread::spawn(move || {
@@ -90,6 +106,7 @@ fn pause_with_phantom_control_fires() {
 #[test]
 #[ignore = "requires a live X server"]
 fn pause_triggers_hotkey() {
+    require_isolated_display();
     let Backend { mut capture, .. } = backend(HotkeySpec::default()).expect("backend");
     let (tx, rx) = crossbeam_channel::unbounded();
     std::thread::spawn(move || {
@@ -118,6 +135,7 @@ fn pause_triggers_hotkey() {
 #[test]
 #[ignore = "requires a live X server"]
 fn capture_reassigns_hotkey() {
+    require_isolated_display();
     let Backend {
         mut capture,
         hotkey,
@@ -163,6 +181,7 @@ fn capture_reassigns_hotkey() {
 #[test]
 #[ignore = "requires a live X server with ru/us layouts"]
 fn layout_switch_round_trips() {
+    require_isolated_display();
     let mut b = backend(HotkeySpec::default()).expect("backend");
 
     b.layout.switch_to(Lang::En).expect("switch en");
@@ -180,6 +199,7 @@ fn layout_switch_round_trips() {
 #[test]
 #[ignore = "requires a live X server"]
 fn backend_builds() {
+    require_isolated_display();
     // Constructing the backend exercises connection setup, XKB group
     // detection, and keymap loading.
     let _ = backend(HotkeySpec::default()).expect("backend builds");
@@ -189,6 +209,7 @@ fn backend_builds() {
 #[test]
 #[ignore = "requires a live X server"]
 fn capture_reports_physical_key() {
+    require_isolated_display();
     let Backend { mut capture, .. } = backend(HotkeySpec::default()).expect("backend");
     let (tx, rx) = crossbeam_channel::unbounded();
     std::thread::spawn(move || {
@@ -225,6 +246,7 @@ fn capture_reports_physical_key() {
 #[test]
 #[ignore = "requires a live X server"]
 fn injected_input_is_suppressed() {
+    require_isolated_display();
     let Backend {
         mut capture,
         mut injector,
@@ -260,6 +282,7 @@ fn injected_input_is_suppressed() {
 #[test]
 #[ignore = "requires a live X server"]
 fn accept_grab_masks_spare_shift_tab() {
+    require_isolated_display();
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{
         ConnectionExt as _, GrabMode, KeyButMask, ModMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
