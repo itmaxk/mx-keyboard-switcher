@@ -75,6 +75,7 @@ const XK_PAUSE: u32 = 0xff13;
 const XK_SCROLL_LOCK: u32 = 0xff14;
 const XK_CONTROL_L: u32 = 0xffe3;
 const XK_G: u32 = 0x0067;
+const XK_RIGHT: u32 = 0xff53;
 
 /// These tests inject raw XTEST events that the X server delivers to whatever
 /// window currently has focus. On a shared desktop display that means phantom
@@ -436,4 +437,56 @@ fn accept_grab_masks_spare_shift_tab() {
         let _ = grab.ungrab_key(TAB, root, ModMask::from(lock));
     }
     let _ = grab.flush();
+}
+
+/// End-to-end through the real backend: with the accept key set to the Right
+/// arrow (the configured default that keeps Tab free for shell completion), the
+/// interception thread must resolve the "RIGHT" name to a keycode, grab it while
+/// active, and deliver an `Accept` — proving arrow keys are assignable accept
+/// keys. (Injecting Right only moves the caret, so it is safe on the isolated
+/// display.)
+#[test]
+#[ignore = "requires a live X server"]
+fn intercept_resolves_and_grabs_right_arrow() {
+    require_isolated_display();
+    let Backend {
+        mut capture,
+        intercept,
+        ..
+    } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300)); // let RECORD + intercept start
+
+    intercept.set_spec(HotkeySpec {
+        ctrl: false,
+        shift: false,
+        alt: false,
+        meta: false,
+        key: "RIGHT".into(),
+    });
+    intercept.set_active(true);
+    std::thread::sleep(Duration::from_millis(200)); // let the grab install
+
+    let right = keycode_of(XK_RIGHT);
+    let mut saw_accept = false;
+    for _ in 0..20 {
+        raw_tap(right);
+        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+            if ev.kind == KeyKind::Accept {
+                saw_accept = true;
+                break;
+            }
+        }
+        if saw_accept {
+            break;
+        }
+    }
+    intercept.set_active(false);
+    assert!(
+        saw_accept,
+        "intercept did not resolve + grab the Right arrow accept key"
+    );
 }

@@ -42,9 +42,20 @@ impl Corrector {
         self.layout.current().ok().flatten()
     }
 
-    /// Type text at the cursor (used to insert a completion remainder).
-    pub fn type_text(&mut self, text: &str) -> Result<()> {
-        self.injector.type_text(text)
+    /// Insert a completion `remainder` whose letters are all in `lang`.
+    ///
+    /// The X11 injector replays *physical key positions*, so it only produces
+    /// `lang`'s letters when the active layout is already `lang`. `word.lang`
+    /// usually matches the active layout, but they drift apart if the user
+    /// switched layout mid-word (or a layout read failed), which would otherwise
+    /// inject the wrong script (e.g. an English completion coming out as
+    /// Cyrillic). Switch to `lang` first — a no-op when already active — exactly
+    /// as [`Corrector::convert`] does before it retypes.
+    pub fn insert_completion(&mut self, remainder: &str, lang: Lang) -> Result<()> {
+        if self.layout.current().ok().flatten() != Some(lang) {
+            self.layout.switch_to(lang)?;
+        }
+        self.injector.type_text(remainder)
     }
 
     /// Replay a real Tab keypress (stale-accept fallback: the key was swallowed

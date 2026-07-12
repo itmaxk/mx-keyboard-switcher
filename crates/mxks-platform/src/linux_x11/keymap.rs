@@ -130,6 +130,10 @@ pub fn named_keysym(sym: u32) -> Option<&'static str> {
         0x0020 => "SPACE",                                   // space
         0xff09 => "TAB",                                     // Tab
         0xff0d => "ENTER",                                   // Return
+        0xff51 => "LEFT",                                    // Left arrow
+        0xff52 => "UP",                                      // Up arrow
+        0xff53 => "RIGHT",                                   // Right arrow
+        0xff54 => "DOWN",                                    // Down arrow
         0xffbe..=0xffc9 => return f_name(sym - 0xffbe + 1),  // F1..F12
         0xffca..=0xffe0 => return f_name(sym - 0xffca + 13), // F13..
         _ => return None,
@@ -156,4 +160,19 @@ fn f_name(n: u32) -> Option<&'static str> {
         16 => "F16",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_keysym;
+
+    #[test]
+    fn arrow_keysyms_are_named() {
+        // Assignable/grabbable accept keys resolve through these names, so the
+        // arrows (e.g. the default "Right" accept key) must be recognized.
+        assert_eq!(named_keysym(0xff51), Some("LEFT"));
+        assert_eq!(named_keysym(0xff52), Some("UP"));
+        assert_eq!(named_keysym(0xff53), Some("RIGHT"));
+        assert_eq!(named_keysym(0xff54), Some("DOWN"));
+    }
 }

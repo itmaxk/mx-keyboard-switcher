@@ -333,7 +333,7 @@ impl Engine {
         self.set_intercept(false);
 
         let lang = self.buffer.current().map(|w| w.lang).unwrap_or(self.active);
-        if let Err(e) = self.corrector.type_text(&remainder) {
+        if let Err(e) = self.corrector.insert_completion(&remainder, lang) {
             tracing::warn!("completion injection failed: {e:#}");
             return;
         }
@@ -582,14 +582,15 @@ mod tests {
 
     struct MockLayout {
         log: Log,
-        current: Lang,
+        current: Arc<Mutex<Lang>>,
     }
     impl LayoutSwitcher for MockLayout {
         fn current(&self) -> Result<Option<Lang>> {
-            Ok(Some(self.current))
+            Ok(Some(*self.current.lock().unwrap()))
         }
         fn switch_to(&mut self, lang: Lang) -> Result<()> {
             self.log.lock().unwrap().push(Op::Switch(lang));
+            *self.current.lock().unwrap() = lang;
             Ok(())
         }
     }
@@ -642,11 +643,29 @@ mod tests {
         crossbeam_channel::Receiver<OverlayCmd>,
         mxks_platform::InterceptControl,
     ) {
+        let (engine, overlay_rx, icontrol, _layout) =
+            autocomplete_engine_with_layout(log, Lang::En);
+        (engine, overlay_rx, icontrol)
+    }
+
+    /// Like [`autocomplete_engine`], but starts the mock system layout at
+    /// `start` and hands back the shared layout cell so a test can flip the
+    /// active layout mid-word (to exercise injection-group correctness).
+    fn autocomplete_engine_with_layout(
+        log: Log,
+        start: Lang,
+    ) -> (
+        Engine,
+        crossbeam_channel::Receiver<OverlayCmd>,
+        mxks_platform::InterceptControl,
+        Arc<Mutex<Lang>>,
+    ) {
+        let current = Arc::new(Mutex::new(start));
         let corrector = Corrector::new(
             Box::new(MockInjector(log.clone())),
             Box::new(MockLayout {
                 log,
-                current: Lang::En,
+                current: current.clone(),
             }),
         );
         let (_hk_ctrl, hk_handle) =
@@ -655,7 +674,7 @@ mod tests {
         let (overlay_tx, overlay_rx) = crossbeam_channel::unbounded();
         let engine = Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle)
             .with_autocomplete(overlay_tx, ihandle, true);
-        (engine, overlay_rx, icontrol)
+        (engine, overlay_rx, icontrol, current)
     }
 
     /// The expected completion remainder for an English prefix, straight from
@@ -675,7 +694,7 @@ mod tests {
             Box::new(MockInjector(log.clone())),
             Box::new(MockLayout {
                 log: log.clone(),
-                current: Lang::En,
+                current: Arc::new(Mutex::new(Lang::En)),
             }),
         );
         let (_hk_ctrl, hk_handle) =
@@ -719,7 +738,7 @@ mod tests {
             Box::new(MockInjector(log.clone())),
             Box::new(MockLayout {
                 log: log.clone(),
-                current: Lang::En,
+                current: Arc::new(Mutex::new(Lang::En)),
             }),
         );
         let (_hk_ctrl, hk_handle) =
@@ -748,7 +767,7 @@ mod tests {
             Box::new(MockInjector(log.clone())),
             Box::new(MockLayout {
                 log: log.clone(),
-                current: Lang::En,
+                current: Arc::new(Mutex::new(Lang::En)),
             }),
         );
         let (_hk_ctrl, hk_handle) =
@@ -836,6 +855,34 @@ mod tests {
         assert!(
             matches!(overlay_rx.try_iter().last(), Some(OverlayCmd::Hide)),
             "overlay not hidden after accept"
+        );
+    }
+
+    /// Regression: if the system layout drifts away from the word's language
+    /// before Accept (e.g. the user switched layout mid-word), injection must
+    /// force the group back to the completion's language first. The X11 injector
+    /// replays physical key positions, so without this an English completion is
+    /// typed through the Russian group and comes out as Cyrillic garbage.
+    #[test]
+    fn accept_forces_group_to_word_language() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _overlay_rx, _icontrol, layout) =
+            autocomplete_engine_with_layout(log.clone(), Lang::En);
+
+        // Type "hel" with English active: the word captures lang = En.
+        for k in [PhysKey::H, PhysKey::E, PhysKey::L] {
+            engine.handle_key(letter(k));
+        }
+        // The system layout flips to Russian before the accept key fires.
+        *layout.lock().unwrap() = Lang::Ru;
+        engine.handle_key(accept());
+
+        // On accept the engine must switch back to En *before* typing.
+        let ops = log.lock().unwrap().clone();
+        assert_eq!(
+            ops,
+            vec![Op::Switch(Lang::En), Op::Type(expected_remainder("hel"))],
+            "completion must be injected in the word's own layout"
         );
     }
 

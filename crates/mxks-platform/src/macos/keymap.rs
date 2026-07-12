@@ -97,6 +97,10 @@ pub fn named_keycode(keycode: u16) -> Option<&'static str> {
         0x77 => "END",
         0x74 => "PAGEUP",
         0x79 => "PAGEDOWN",
+        0x7B => "LEFT",
+        0x7E => "UP",
+        0x7C => "RIGHT",
+        0x7D => "DOWN",
         _ => return None,
     })
 }
