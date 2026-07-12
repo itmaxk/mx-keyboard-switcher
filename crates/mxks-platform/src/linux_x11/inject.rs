@@ -13,6 +13,7 @@
 use anyhow::Result;
 use mxks_core::layout::{char_to_key, is_letter_of, to_lower, Lang};
 use x11rb::connection::Connection;
+use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -24,12 +25,35 @@ use super::suppress::Suppress;
 pub struct X11Injector {
     conn: RustConnection,
     suppress: Suppress,
+    /// Every keycode bound to a modifier, released before each injection so a
+    /// physically-held modifier (e.g. the Ctrl of a Ctrl+Pause hotkey) does not
+    /// turn our injected keystrokes into Ctrl+/Alt+ chords and corrupt them.
+    modifier_keycodes: Vec<u8>,
 }
 
 impl X11Injector {
     pub fn new(suppress: Suppress) -> Result<Self> {
         let (conn, _) = RustConnection::connect(None)?;
-        Ok(X11Injector { conn, suppress })
+        let modifier_keycodes = conn
+            .get_modifier_mapping()?
+            .reply()
+            .map(|m| m.keycodes.into_iter().filter(|&k| k != 0).collect())
+            .unwrap_or_default();
+        Ok(X11Injector {
+            conn,
+            suppress,
+            modifier_keycodes,
+        })
+    }
+
+    /// Fake-release every modifier key so injected taps are unmodified. A
+    /// release of a key that is not held is a harmless no-op.
+    fn clear_modifiers(&self) -> Result<()> {
+        for &kc in &self.modifier_keycodes {
+            self.fake_key(false, kc)?;
+        }
+        self.conn.flush()?;
+        Ok(())
     }
 
     fn fake_key(&self, press: bool, keycode: u8) -> Result<()> {
@@ -82,6 +106,7 @@ impl X11Injector {
 
 impl crate::KeyInjector for X11Injector {
     fn backspaces(&mut self, n: usize) -> Result<()> {
+        self.clear_modifiers()?;
         for _ in 0..n {
             self.tap_key(KC_BACKSPACE, false)?;
         }
@@ -90,6 +115,7 @@ impl crate::KeyInjector for X11Injector {
     }
 
     fn type_text(&mut self, text: &str) -> Result<()> {
+        self.clear_modifiers()?;
         for c in text.chars() {
             self.tap_char(c)?;
         }
@@ -98,6 +124,7 @@ impl crate::KeyInjector for X11Injector {
     }
 
     fn tab(&mut self) -> Result<()> {
+        self.clear_modifiers()?;
         self.tap_key(KC_TAB, false)?;
         self.conn.flush()?;
         Ok(())

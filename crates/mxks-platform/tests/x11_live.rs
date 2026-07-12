@@ -490,3 +490,66 @@ fn intercept_resolves_and_grabs_right_arrow() {
         "intercept did not resolve + grab the Right arrow accept key"
     );
 }
+
+/// A conversion triggered by a modifier hotkey (e.g. Ctrl+Pause) injects while
+/// the user still holds the modifier. The injector must release held modifiers
+/// first, or the injected keys become Ctrl+/Alt+ chords and corrupt the output.
+#[test]
+#[ignore = "requires a live X server"]
+fn injection_releases_held_modifiers() {
+    require_isolated_display();
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        ConnectionExt as _, KeyButMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    };
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+
+    let Backend { mut injector, .. } = backend(HotkeySpec::default()).expect("backend");
+    // Hold Ctrl on a *persistent* connection: an ephemeral one (raw_key) drops
+    // immediately and the server releases the key with it.
+    let (probe, screen) = RustConnection::connect(None).expect("probe conn");
+    let root = probe.setup().roots[screen].root;
+    let ctrl = keycode_of(XK_CONTROL_L);
+
+    // Physically hold Ctrl and confirm the server reports it.
+    probe
+        .xtest_fake_input(KEY_PRESS_EVENT, ctrl, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    probe.flush().unwrap();
+    let mut held = false;
+    for _ in 0..50 {
+        if probe
+            .query_pointer(root)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .mask
+            .contains(KeyButMask::CONTROL)
+        {
+            held = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(held, "could not establish a held Ctrl state");
+
+    // Any injection must clear the held modifier first.
+    injector.type_text("a").expect("type");
+    std::thread::sleep(Duration::from_millis(50));
+    let still_held = probe
+        .query_pointer(root)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .mask
+        .contains(KeyButMask::CONTROL);
+
+    // cleanup regardless of outcome
+    let _ = probe.xtest_fake_input(KEY_RELEASE_EVENT, ctrl, 0, x11rb::NONE, 0, 0, 0);
+    let _ = probe.flush();
+    assert!(
+        !still_held,
+        "injector left Ctrl held; injected keys would be Ctrl+ chords"
+    );
+}
