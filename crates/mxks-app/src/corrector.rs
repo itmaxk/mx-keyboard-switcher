@@ -41,4 +41,15 @@ impl Corrector {
     pub fn current_layout(&self) -> Option<Lang> {
         self.layout.current().ok().flatten()
     }
+
+    /// Type text at the cursor (used to insert a completion remainder).
+    pub fn type_text(&mut self, text: &str) -> Result<()> {
+        self.injector.type_text(text)
+    }
+
+    /// Replay a real Tab keypress (stale-accept fallback: the key was swallowed
+    /// but there is no suggestion to complete, so give the app its Tab back).
+    pub fn tab(&mut self) -> Result<()> {
+        self.injector.tab()
+    }
 }

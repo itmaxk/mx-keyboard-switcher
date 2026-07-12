@@ -14,15 +14,16 @@ use mxks_core::hotkey::HotkeySpec;
 use super::keymap;
 use super::MAGIC;
 use crate::event::{KeyEvent, KeyKind};
-use crate::HotkeyControl;
+use crate::{HotkeyControl, InterceptControl};
 
 pub struct MacCapture {
     hotkey: HotkeyControl,
+    intercept: InterceptControl,
 }
 
 impl MacCapture {
-    pub fn new(hotkey: HotkeyControl) -> Self {
-        MacCapture { hotkey }
+    pub fn new(hotkey: HotkeyControl, intercept: InterceptControl) -> Self {
+        MacCapture { hotkey, intercept }
     }
 }
 
@@ -107,6 +108,7 @@ fn classify(keycode: u16, m: &Mods, spec: &HotkeySpec) -> Option<KeyKind> {
 impl crate::KeyCapture for MacCapture {
     fn run(&mut self, tx: Sender<KeyEvent>) -> Result<()> {
         let hotkey = self.hotkey.clone();
+        let intercept = self.intercept.clone();
 
         let tap = CGEventTap::new(
             CGEventTapLocation::HID,
@@ -120,7 +122,19 @@ impl crate::KeyCapture for MacCapture {
                     let keycode =
                         event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                     let m = mods(event.get_flags());
-                    if hotkey.is_capturing() {
+                    // NOTE: autocomplete accept. A ListenOnly tap cannot drop
+                    // events, and core-graphics 0.24's safe callback offers no
+                    // way to return NULL from an active tap either (returning
+                    // `None` passes the original event through). The overlay is
+                    // also stubbed on macOS, so the engine never activates
+                    // interception here; this branch is future-proofing only.
+                    if intercept.is_active() && matches_hotkey(keycode, &m, &intercept.current()) {
+                        let _ = tx.send(KeyEvent {
+                            kind: KeyKind::Accept,
+                            down: true,
+                            injected: false,
+                        });
+                    } else if hotkey.is_capturing() {
                         if let Some(spec) = capture_spec(keycode, &m) {
                             hotkey.record(spec);
                         }

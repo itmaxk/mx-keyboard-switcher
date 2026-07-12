@@ -4,10 +4,12 @@
 use crossbeam_channel::{Receiver, Sender};
 use mxks_core::buffer::{Event, Word, WordBuffer};
 use mxks_core::config::Config;
-use mxks_core::convert::Stroke;
+use mxks_core::convert::{render_keys, Stroke};
 use mxks_core::detect::{analyze, Params, Verdict};
 use mxks_core::layout::Lang;
-use mxks_platform::{FocusInfo, HotkeyHandle, KeyEvent, KeyKind};
+use mxks_platform::{
+    CaptureTarget, FocusInfo, HotkeyHandle, InterceptHandle, KeyEvent, KeyKind, OverlayCmd,
+};
 
 use crate::corrector::Corrector;
 
@@ -27,6 +29,10 @@ pub enum Command {
     ReloadConfig,
     /// Arm "press a key" capture to reassign the conversion hotkey.
     SetHotkey,
+    /// Toggle word autocomplete.
+    ToggleAutocomplete,
+    /// Arm "press a key" capture to reassign the autocomplete accept key.
+    SetAcceptKey,
     /// Quit the application.
     Quit,
 }
@@ -42,6 +48,10 @@ pub struct Status {
     pub hotkey: String,
     /// True while waiting for the user to press a key to assign.
     pub capturing: bool,
+    /// Autocomplete on/off (false also when the platform has no overlay).
+    pub autocomplete: bool,
+    /// Current accept key, human-readable (e.g. "Tab").
+    pub accept_key: String,
 }
 
 /// The result of the most recent *manual* conversion, kept so the hotkey can
@@ -68,6 +78,14 @@ pub struct Engine {
     toggle: Option<Toggle>,
     /// Broadcasts status changes so the tray can update its menu.
     status_tx: Option<Sender<Status>>,
+    /// Remainder of the currently suggested completion, if one is visible.
+    suggestion: Option<String>,
+    /// Channel to the overlay thread (non-blocking sends only).
+    overlay_tx: Option<Sender<OverlayCmd>>,
+    /// Toggles accept-key interception in the capture backend.
+    intercept: Option<InterceptHandle>,
+    /// False when the platform has no overlay — autocomplete stays inert.
+    overlay_available: bool,
 }
 
 impl Engine {
@@ -90,11 +108,29 @@ impl Engine {
             last: None,
             toggle: None,
             status_tx: None,
+            suggestion: None,
+            overlay_tx: None,
+            intercept: None,
+            overlay_available: false,
         }
     }
 
     pub fn with_status_channel(mut self, tx: Sender<Status>) -> Self {
         self.status_tx = Some(tx);
+        self
+    }
+
+    /// Wire up autocomplete: the overlay command channel, the accept-key
+    /// interception handle, and whether the platform overlay actually works.
+    pub fn with_autocomplete(
+        mut self,
+        overlay_tx: Sender<OverlayCmd>,
+        intercept: InterceptHandle,
+        overlay_available: bool,
+    ) -> Self {
+        self.overlay_tx = Some(overlay_tx);
+        self.intercept = Some(intercept);
+        self.overlay_available = overlay_available;
         self
     }
 
@@ -104,6 +140,8 @@ impl Engine {
             autocorrect: self.config.general.autocorrect,
             hotkey: self.config.hotkeys.convert_last_word.clone(),
             capturing: self.capturing,
+            autocomplete: self.config.autocomplete.enabled && self.overlay_available,
+            accept_key: self.config.autocomplete.accept_key.clone(),
         }
     }
 
@@ -129,23 +167,37 @@ impl Engine {
                     }
                 },
                 recv(hk_rx) -> msg => {
-                    if let Ok(spec) = msg {
-                        self.on_hotkey_assigned(spec);
+                    if let Ok((target, spec)) = msg {
+                        self.on_key_assigned(target, spec);
                     }
                 },
             }
         }
     }
 
-    /// A new hotkey was captured: persist it and update state.
-    fn on_hotkey_assigned(&mut self, spec: mxks_core::hotkey::HotkeySpec) {
+    /// A new key was captured: persist it and update state.
+    fn on_key_assigned(&mut self, target: CaptureTarget, spec: mxks_core::hotkey::HotkeySpec) {
         let shown = spec.display();
-        self.config.hotkeys.convert_last_word = shown.clone();
         self.capturing = false;
-        if let Err(e) = crate::config_io::save_hotkey(&shown) {
-            tracing::warn!("could not save hotkey: {e:#}");
+        match target {
+            CaptureTarget::ConvertHotkey => {
+                self.config.hotkeys.convert_last_word = shown.clone();
+                if let Err(e) = crate::config_io::save_hotkey(&shown) {
+                    tracing::warn!("could not save hotkey: {e:#}");
+                }
+                tracing::info!("conversion hotkey set to {shown}");
+            }
+            CaptureTarget::AcceptKey => {
+                self.config.autocomplete.accept_key = shown.clone();
+                if let Some(i) = &self.intercept {
+                    i.set_spec(spec);
+                }
+                if let Err(e) = crate::config_io::save_accept_key(&shown) {
+                    tracing::warn!("could not save accept key: {e:#}");
+                }
+                tracing::info!("autocomplete accept key set to {shown}");
+            }
         }
-        tracing::info!("conversion hotkey set to {shown}");
         self.broadcast_status();
     }
 
@@ -168,20 +220,146 @@ impl Engine {
                     self.last = None;
                 }
                 self.buffer.feed(Event::Letter(Stroke { key, shift }));
+                self.refresh_suggestion();
             }
             KeyKind::Backspace => {
                 self.buffer.feed(Event::Backspace);
+                self.refresh_suggestion();
             }
             KeyKind::Boundary { sep } => {
+                self.dismiss_suggestion();
                 if let Some(word) = self.buffer.feed(Event::Boundary) {
                     self.on_word(word, sep);
                 }
             }
             KeyKind::Reset => {
+                self.dismiss_suggestion();
                 self.buffer.feed(Event::Reset);
                 self.last = None;
             }
-            KeyKind::Hotkey => self.manual_convert(),
+            KeyKind::Hotkey => {
+                self.dismiss_suggestion();
+                self.manual_convert();
+            }
+            KeyKind::Accept => self.on_accept(),
+        }
+    }
+
+    /// Recompute the completion for the in-progress word and sync the overlay
+    /// and accept-key interception with it.
+    fn refresh_suggestion(&mut self) {
+        if self.overlay_tx.is_none() {
+            return;
+        }
+        let want = self.compute_suggestion();
+        if want.is_none() && self.suggestion.is_none() {
+            return;
+        }
+        match &want {
+            // Re-send even when unchanged so the hint follows the caret.
+            Some(text) => {
+                self.send_overlay(OverlayCmd::Show { text: text.clone() });
+                self.set_intercept(true);
+            }
+            None => {
+                self.send_overlay(OverlayCmd::Hide);
+                self.set_intercept(false);
+            }
+        }
+        self.suggestion = want;
+    }
+
+    /// The remainder to suggest for the current word, if any.
+    fn compute_suggestion(&self) -> Option<String> {
+        let ac = &self.config.autocomplete;
+        if !ac.enabled || !self.enabled || !self.overlay_available {
+            return None;
+        }
+        let word = self.buffer.current()?;
+        let prefix = render_keys(&word.keys, word.lang).to_lowercase();
+        let prefix_len = prefix.chars().count();
+        if prefix_len < ac.min_prefix {
+            return None;
+        }
+        if self.app_excluded() {
+            return None;
+        }
+        let full = mxks_core::dict::complete(&prefix, word.lang)?;
+        let remainder: String = full.chars().skip(prefix_len).collect();
+        if remainder.chars().count() < ac.min_remainder {
+            return None;
+        }
+        // All-caps input gets an all-caps completion; otherwise keep lowercase
+        // (a leading capital still yields "Hel" + "lo").
+        if word.keys.len() >= 2 && word.keys.iter().all(|s| s.shift) {
+            return Some(remainder.to_uppercase());
+        }
+        Some(remainder)
+    }
+
+    /// Hide the hint and stop intercepting the accept key.
+    fn dismiss_suggestion(&mut self) {
+        if self.suggestion.take().is_some() {
+            self.send_overlay(OverlayCmd::Hide);
+            self.set_intercept(false);
+        }
+    }
+
+    /// The accept key fired (and was swallowed by the backend where possible).
+    fn on_accept(&mut self) {
+        let Some(remainder) = self.suggestion.take() else {
+            // Stale accept: the suggestion was dismissed while the keypress was
+            // in flight. Replay a real Tab so the user's keystroke isn't lost
+            // (other accept keys are inert on their own — just drop those).
+            self.set_intercept(false);
+            if self
+                .intercept
+                .as_ref()
+                .is_some_and(|i| i.current().key == "TAB")
+            {
+                if let Err(e) = self.corrector.tab() {
+                    tracing::warn!("could not replay tab: {e:#}");
+                }
+                if let Some(word) = self.buffer.feed(Event::Boundary) {
+                    self.on_word(word, None);
+                }
+            } else {
+                self.buffer.feed(Event::Reset);
+            }
+            return;
+        };
+
+        self.send_overlay(OverlayCmd::Hide);
+        self.set_intercept(false);
+
+        let lang = self.buffer.current().map(|w| w.lang).unwrap_or(self.active);
+        if let Err(e) = self.corrector.type_text(&remainder) {
+            tracing::warn!("completion injection failed: {e:#}");
+            return;
+        }
+        // Mirror the injected letters into the buffer so it matches the screen;
+        // the completed word is a dictionary word of `lang` by construction, so
+        // a later Space boundary will never "correct" it.
+        for c in remainder.chars() {
+            let lower = mxks_core::layout::to_lower(c);
+            if let Some(key) = mxks_core::layout::char_to_key(lower, lang) {
+                self.buffer.feed(Event::Letter(Stroke {
+                    key,
+                    shift: c != lower,
+                }));
+            }
+        }
+    }
+
+    fn send_overlay(&self, cmd: OverlayCmd) {
+        if let Some(tx) = &self.overlay_tx {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    fn set_intercept(&self, on: bool) {
+        if let Some(i) = &self.intercept {
+            i.set_active(on);
         }
     }
 
@@ -296,6 +474,14 @@ impl Engine {
             }
             Command::ReloadConfig => {
                 self.config = crate::config_io::load();
+                // Re-apply autocomplete settings: the accept key may have
+                // changed and a visible suggestion may now be stale.
+                self.dismiss_suggestion();
+                if let Some(spec) = mxks_core::hotkey::parse(&self.config.autocomplete.accept_key) {
+                    if let Some(i) = &self.intercept {
+                        i.set_spec(spec);
+                    }
+                }
                 tracing::info!("config reloaded");
                 self.broadcast_status();
             }
@@ -306,8 +492,26 @@ impl Engine {
             }
             Command::SetHotkey => {
                 self.capturing = true;
-                self.hotkey.begin_capture();
+                self.hotkey.begin_capture(CaptureTarget::ConvertHotkey);
                 tracing::info!("press a key (optionally with modifiers) to set the hotkey");
+                self.broadcast_status();
+            }
+            Command::ToggleAutocomplete => {
+                let on = !self.config.autocomplete.enabled;
+                self.config.autocomplete.enabled = on;
+                if !on {
+                    self.dismiss_suggestion();
+                }
+                if let Err(e) = crate::config_io::save_autocomplete_enabled(on) {
+                    tracing::warn!("could not save autocomplete switch: {e:#}");
+                }
+                tracing::info!("autocomplete = {on}");
+                self.broadcast_status();
+            }
+            Command::SetAcceptKey => {
+                self.capturing = true;
+                self.hotkey.begin_capture(CaptureTarget::AcceptKey);
+                tracing::info!("press a key (optionally with modifiers) to set the accept key");
                 self.broadcast_status();
             }
             Command::Quit => return true,
@@ -355,6 +559,7 @@ mod tests {
         Backspaces(usize),
         Switch(Lang),
         Type(String),
+        Tab,
     }
 
     type Log = Arc<Mutex<Vec<Op>>>;
@@ -367,6 +572,10 @@ mod tests {
         }
         fn type_text(&mut self, text: &str) -> Result<()> {
             self.0.lock().unwrap().push(Op::Type(text.to_string()));
+            Ok(())
+        }
+        fn tab(&mut self) -> Result<()> {
+            self.0.lock().unwrap().push(Op::Tab);
             Ok(())
         }
     }
@@ -408,6 +617,53 @@ mod tests {
             down: true,
             injected: false,
         }
+    }
+    fn accept() -> KeyEvent {
+        KeyEvent {
+            kind: KeyKind::Accept,
+            down: true,
+            injected: false,
+        }
+    }
+    fn backspace() -> KeyEvent {
+        KeyEvent {
+            kind: KeyKind::Backspace,
+            down: true,
+            injected: false,
+        }
+    }
+
+    /// Engine with autocomplete wired to a mock overlay channel and a real
+    /// intercept pair (the control side lets tests observe the active flag).
+    fn autocomplete_engine(
+        log: Log,
+    ) -> (
+        Engine,
+        crossbeam_channel::Receiver<OverlayCmd>,
+        mxks_platform::InterceptControl,
+    ) {
+        let corrector = Corrector::new(
+            Box::new(MockInjector(log.clone())),
+            Box::new(MockLayout {
+                log,
+                current: Lang::En,
+            }),
+        );
+        let (_hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        let (icontrol, ihandle) = mxks_platform::intercept_channel(mxks_platform::default_accept());
+        let (overlay_tx, overlay_rx) = crossbeam_channel::unbounded();
+        let engine = Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle)
+            .with_autocomplete(overlay_tx, ihandle, true);
+        (engine, overlay_rx, icontrol)
+    }
+
+    /// The expected completion remainder for an English prefix, straight from
+    /// the dictionary (keeps tests independent of frequency-table contents).
+    fn expected_remainder(prefix: &str) -> String {
+        let full = mxks_core::dict::complete(prefix, Lang::En)
+            .unwrap_or_else(|| panic!("dictionary has no completion for {prefix:?}"));
+        full.chars().skip(prefix.chars().count()).collect()
     }
 
     /// Typing "ghbdtn " in English must produce the exact correction sequence:
@@ -532,5 +788,92 @@ mod tests {
                 Op::Type("ghbdtn".to_string()),
             ]
         );
+    }
+
+    /// Three letters ("hel") must produce a Show with the dictionary remainder
+    /// and turn accept-key interception on.
+    #[test]
+    fn suggestion_appears_after_min_prefix() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, overlay_rx, icontrol) = autocomplete_engine(log);
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        for k in [PhysKey::H, PhysKey::E, PhysKey::L] {
+            key_tx.send(letter(k)).unwrap();
+        }
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        let last = overlay_rx.try_iter().last().expect("no overlay commands");
+        match last {
+            OverlayCmd::Show { text } => assert_eq!(text, expected_remainder("hel")),
+            other => panic!("expected Show, got {other:?}"),
+        }
+        assert!(icontrol.is_active(), "interception not enabled");
+    }
+
+    /// Accept must type exactly the remainder, and the following Space must not
+    /// trigger any correction (the completed word is a dictionary word).
+    #[test]
+    fn accept_types_remainder_and_space_does_not_correct() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, overlay_rx, icontrol) = autocomplete_engine(log.clone());
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        for k in [PhysKey::H, PhysKey::E, PhysKey::L] {
+            key_tx.send(letter(k)).unwrap();
+        }
+        key_tx.send(accept()).unwrap();
+        key_tx.send(space()).unwrap();
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        let ops = log.lock().unwrap().clone();
+        assert_eq!(ops, vec![Op::Type(expected_remainder("hel"))]);
+        assert!(!icontrol.is_active(), "interception left on after accept");
+        assert!(
+            matches!(overlay_rx.try_iter().last(), Some(OverlayCmd::Hide)),
+            "overlay not hidden after accept"
+        );
+    }
+
+    /// A stale Accept (no suggestion on screen) must replay a real Tab so the
+    /// user's keystroke isn't lost.
+    #[test]
+    fn stale_accept_replays_tab() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _overlay_rx, _icontrol) = autocomplete_engine(log.clone());
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        key_tx.send(accept()).unwrap();
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        assert_eq!(log.lock().unwrap().clone(), vec![Op::Tab]);
+    }
+
+    /// Backspacing below min_prefix must hide the hint and drop interception.
+    #[test]
+    fn backspace_below_min_prefix_hides_suggestion() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, overlay_rx, icontrol) = autocomplete_engine(log);
+
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        for k in [PhysKey::H, PhysKey::E, PhysKey::L] {
+            key_tx.send(letter(k)).unwrap();
+        }
+        key_tx.send(backspace()).unwrap();
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+
+        assert!(
+            matches!(overlay_rx.try_iter().last(), Some(OverlayCmd::Hide)),
+            "overlay not hidden after backspace below min_prefix"
+        );
+        assert!(!icontrol.is_active(), "interception left on");
     }
 }

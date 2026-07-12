@@ -2,14 +2,16 @@
 //!
 //! Reads the human-editable word lists in `data/` and compiles them into
 //! `OUT_DIR/tables.rs`:
-//!   * sorted, deduplicated word arrays for fast dictionary lookup, and
+//!   * sorted, deduplicated word arrays for fast dictionary lookup,
+//!   * parallel frequency-rank arrays (rank 0 = most frequent) used by the
+//!     autocomplete engine to pick the best completion, and
 //!   * per-language character bigram log-probability matrices (Laplace-smoothed)
 //!     used by the wrong-layout detector.
 //!
 //! Keeping this at build time means the binary embeds compact static tables
 //! (a few hundred KB) with no startup parsing cost.
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -36,13 +38,15 @@ fn main() {
         println!("cargo:rerun-if-changed={}", p.display());
     }
 
+    // Words in frequency order (position = rank, 0 = most frequent).
     let mut en_words = load_freq(&en_freq, EN_ALPHABET, EN_MAX);
     merge_plain(&mut en_words, &en_common, EN_ALPHABET);
     merge_plain(&mut en_words, &it_terms, EN_ALPHABET);
-    let en_words: Vec<String> = en_words.into_iter().collect();
-    let ru_words = load_freq(&ru_path, RU_ALPHABET, RU_MAX)
-        .into_iter()
-        .collect::<Vec<_>>();
+    let ru_words = load_freq(&ru_path, RU_ALPHABET, RU_MAX);
+
+    // Alphabetical order for binary search, with a parallel rank array.
+    let (en_words, en_ranks) = sorted_with_ranks(en_words);
+    let (ru_words, ru_ranks) = sorted_with_ranks(ru_words);
 
     let en_bigram = bigram_table(&en_words, EN_ALPHABET);
     let ru_bigram = bigram_table(&ru_words, RU_ALPHABET);
@@ -53,6 +57,8 @@ fn main() {
     writeln!(out, "pub const RU_ALPHABET: &str = {:?};", RU_ALPHABET).unwrap();
     emit_words(&mut out, "EN_WORDS", &en_words);
     emit_words(&mut out, "RU_WORDS", &ru_words);
+    emit_ranks(&mut out, "EN_RANKS", &en_ranks);
+    emit_ranks(&mut out, "RU_RANKS", &ru_ranks);
     emit_matrix(
         &mut out,
         "EN_BIGRAM",
@@ -72,31 +78,53 @@ fn main() {
 
 /// Load a "word frequency" file (`word count` per line, most-frequent first),
 /// keeping up to `max` words that are pure letters of `alphabet`.
-fn load_freq(path: &PathBuf, alphabet: &str, max: usize) -> BTreeSet<String> {
+/// File order is preserved so a word's index is its frequency rank.
+fn load_freq(path: &PathBuf, alphabet: &str, max: usize) -> Vec<String> {
     let text = fs::read_to_string(path).unwrap_or_default();
-    let mut set = BTreeSet::new();
-    let mut taken = 0usize;
+    let mut seen = HashSet::new();
+    let mut words = Vec::new();
     for line in text.lines() {
-        if taken >= max {
+        if words.len() >= max {
             break;
         }
         let word = line.split_whitespace().next().unwrap_or("").to_lowercase();
-        if !word.is_empty() && word.chars().all(|c| alphabet.contains(c)) && set.insert(word) {
-            taken += 1;
+        if !word.is_empty()
+            && word.chars().all(|c| alphabet.contains(c))
+            && seen.insert(word.clone())
+        {
+            words.push(word);
         }
     }
-    set
+    words
 }
 
-/// Merge a plain one-word-per-line list into `set` (all entries kept).
-fn merge_plain(set: &mut BTreeSet<String>, path: &PathBuf, alphabet: &str) {
+/// Merge a plain one-word-per-line list into `words` (all new entries kept,
+/// appended after the frequency list so they rank below it).
+fn merge_plain(words: &mut Vec<String>, path: &PathBuf, alphabet: &str) {
+    let mut seen: HashSet<String> = words.iter().cloned().collect();
     let text = fs::read_to_string(path).unwrap_or_default();
     for line in text.lines() {
         let w = line.trim().to_lowercase();
-        if !w.is_empty() && w.chars().all(|c| alphabet.contains(c)) {
-            set.insert(w);
+        if !w.is_empty() && w.chars().all(|c| alphabet.contains(c)) && seen.insert(w.clone()) {
+            words.push(w);
         }
     }
+}
+
+/// Sort frequency-ordered `words` alphabetically, returning the sorted list
+/// plus a parallel array of each word's original frequency rank.
+fn sorted_with_ranks(words: Vec<String>) -> (Vec<String>, Vec<u16>) {
+    assert!(
+        words.len() < u16::MAX as usize,
+        "word count exceeds u16 rank range"
+    );
+    let mut pairs: Vec<(String, u16)> = words
+        .into_iter()
+        .enumerate()
+        .map(|(i, w)| (w, i as u16))
+        .collect();
+    pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    pairs.into_iter().unzip()
 }
 
 /// Build a Laplace-smoothed bigram log-probability matrix over
@@ -139,6 +167,18 @@ fn emit_words(out: &mut String, name: &str, words: &[String]) {
     writeln!(out, "pub static {name}: &[&str] = &[").unwrap();
     for w in words {
         writeln!(out, "    {w:?},").unwrap();
+    }
+    out.push_str("];\n");
+}
+
+fn emit_ranks(out: &mut String, name: &str, ranks: &[u16]) {
+    writeln!(out, "pub static {name}: &[u16] = &[").unwrap();
+    for chunk in ranks.chunks(20) {
+        out.push_str("    ");
+        for r in chunk {
+            write!(out, "{r},").unwrap();
+        }
+        out.push('\n');
     }
     out.push_str("];\n");
 }

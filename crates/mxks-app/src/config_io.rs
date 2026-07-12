@@ -22,25 +22,50 @@ pub fn load() -> Config {
     }
 }
 
-/// Persist a new conversion hotkey into the config file, preserving comments by
-/// replacing just the `convert_last_word` line.
+/// Persist a new conversion hotkey into the config file.
 pub fn save_hotkey(display: &str) -> Result<()> {
+    save_key_line("hotkeys", "convert_last_word", &format!("\"{display}\""))
+}
+
+/// Persist a new autocomplete accept key into the config file.
+pub fn save_accept_key(display: &str) -> Result<()> {
+    save_key_line("autocomplete", "accept_key", &format!("\"{display}\""))
+}
+
+/// Persist the autocomplete on/off switch into the config file.
+pub fn save_autocomplete_enabled(on: bool) -> Result<()> {
+    save_key_line("autocomplete", "enabled", if on { "true" } else { "false" })
+}
+
+/// Replace `key = <value>` inside `[section]` of the config file, preserving
+/// comments and everything else line-by-line. Appends the section+key when the
+/// file does not contain them yet.
+fn save_key_line(section: &str, key: &str, value: &str) -> Result<()> {
     let path = config_path()?;
     let text = std::fs::read_to_string(&path).unwrap_or_else(|_| DEFAULT_TEMPLATE.to_string());
 
     let mut out = String::new();
     let mut replaced = false;
+    let mut current_section = String::new();
     for line in text.lines() {
-        if line.trim_start().starts_with("convert_last_word") {
-            out.push_str(&format!("convert_last_word = \"{display}\"\n"));
-            replaced = true;
-        } else {
-            out.push_str(line);
-            out.push('\n');
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            current_section = name.trim().to_string();
+        } else if !replaced && current_section == section {
+            // Match `key` followed by `=` or whitespace (not e.g. `key_other`).
+            if let Some(rest) = t.strip_prefix(key) {
+                if rest.trim_start().starts_with('=') {
+                    out.push_str(&format!("{key} = {value}\n"));
+                    replaced = true;
+                    continue;
+                }
+            }
         }
+        out.push_str(line);
+        out.push('\n');
     }
     if !replaced {
-        out.push_str(&format!("\n[hotkeys]\nconvert_last_word = \"{display}\"\n"));
+        out.push_str(&format!("\n[{section}]\n{key} = {value}\n"));
     }
 
     if let Some(parent) = path.parent() {

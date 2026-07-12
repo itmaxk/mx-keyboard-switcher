@@ -29,6 +29,9 @@ pub enum KeyKind {
     Boundary { sep: Option<char> },
     /// The user's convert-last-word hotkey fired.
     Hotkey,
+    /// The autocomplete accept key fired while interception was active (the
+    /// backend swallowed the physical keypress where the platform allows).
+    Accept,
     /// Something that invalidates the word buffer (arrows, Esc, modifier chord,
     /// mouse click, focus/layout change).
     Reset,

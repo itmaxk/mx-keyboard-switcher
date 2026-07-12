@@ -7,7 +7,7 @@
 
 pub mod event;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -30,6 +30,11 @@ pub trait KeyInjector: Send {
     fn backspaces(&mut self, n: usize) -> Result<()>;
     /// Type `text` as Unicode input (layout-independent where the OS allows).
     fn type_text(&mut self, text: &str) -> Result<()>;
+    /// Send one real Tab keypress (replays a swallowed accept key that turned
+    /// out to be stale).
+    fn tab(&mut self) -> Result<()> {
+        anyhow::bail!("tab injection not supported on this platform")
+    }
 }
 
 /// Reads and switches the active system keyboard layout.
@@ -52,6 +57,29 @@ pub trait FocusInfo: Send {
     }
 }
 
+/// Command for the suggestion overlay thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverlayCmd {
+    /// Show (or update) the gray completion hint near the caret/pointer.
+    Show { text: String },
+    /// Hide the hint.
+    Hide,
+    /// Tear down and exit the overlay thread.
+    Shutdown,
+}
+
+/// Draws the gray suggestion hint. Runs a blocking loop on its own thread; the
+/// engine only ever sends non-blocking [`OverlayCmd`]s.
+pub trait Overlay: Send {
+    /// Blocking command loop; returns on `Shutdown` or fatal error.
+    fn run(&mut self, rx: Receiver<OverlayCmd>) -> Result<()>;
+    /// False on platforms without a real implementation — the engine then
+    /// keeps autocomplete inert (no invisible suggestions, no key stealing).
+    fn available(&self) -> bool {
+        true
+    }
+}
+
 /// A fully assembled platform backend.
 pub struct Backend {
     pub capture: Box<dyn KeyCapture>,
@@ -60,15 +88,141 @@ pub struct Backend {
     pub focus: Box<dyn FocusInfo>,
     /// Live control over the conversion hotkey (reassign at runtime).
     pub hotkey: HotkeyHandle,
+    /// Live control over autocomplete accept-key interception.
+    pub intercept: InterceptHandle,
+    /// Suggestion-hint overlay (may be a stub; check `available()`).
+    pub overlay: Box<dyn Overlay>,
 }
 
+/// Command sent to a backend's interception machinery when its state changes
+/// (Linux uses these to wake the XGrabKey thread).
+#[derive(Clone, Debug)]
+pub enum InterceptCmd {
+    /// Start/stop swallowing the accept key (a suggestion became visible/hidden).
+    Active(bool),
+    /// The accept key was reassigned.
+    Spec(HotkeySpec),
+}
+
+/// Shared with the capture backend: whether a suggestion is currently visible
+/// (so the accept key must be swallowed) and which key accepts it.
+#[derive(Clone)]
+pub struct InterceptControl {
+    active: Arc<AtomicBool>,
+    spec: Arc<Mutex<HotkeySpec>>,
+    cmds: Receiver<InterceptCmd>,
+}
+
+impl InterceptControl {
+    /// True while a suggestion is visible and the accept key must be intercepted.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+    /// The current accept-key spec.
+    pub fn current(&self) -> HotkeySpec {
+        self.spec.lock().unwrap().clone()
+    }
+    /// Wake-up channel for backends that run a dedicated interception loop.
+    pub fn commands(&self) -> &Receiver<InterceptCmd> {
+        &self.cmds
+    }
+}
+
+/// Engine-side handle: toggle interception and reassign the accept key.
+pub struct InterceptHandle {
+    active: Arc<AtomicBool>,
+    spec: Arc<Mutex<HotkeySpec>>,
+    cmds: Sender<InterceptCmd>,
+}
+
+impl InterceptHandle {
+    /// Announce that a suggestion became visible (`true`) or was dismissed.
+    pub fn set_active(&self, on: bool) {
+        if self.active.swap(on, Ordering::SeqCst) != on {
+            let _ = self.cmds.send(InterceptCmd::Active(on));
+        }
+    }
+    /// Install a new accept-key spec.
+    pub fn set_spec(&self, spec: HotkeySpec) {
+        *self.spec.lock().unwrap() = spec.clone();
+        let _ = self.cmds.send(InterceptCmd::Spec(spec));
+    }
+    /// The current accept-key spec.
+    pub fn current(&self) -> HotkeySpec {
+        self.spec.lock().unwrap().clone()
+    }
+}
+
+/// No-op overlay for platforms without an implementation. Drains the channel
+/// so senders never block; reports itself unavailable.
+pub struct StubOverlay;
+
+impl Overlay for StubOverlay {
+    fn run(&mut self, rx: Receiver<OverlayCmd>) -> Result<()> {
+        while let Ok(cmd) = rx.recv() {
+            if matches!(cmd, OverlayCmd::Shutdown) {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn available(&self) -> bool {
+        false
+    }
+}
+
+/// Default accept-key spec (plain Tab) used to seed backends before the app
+/// applies the configured key via [`InterceptHandle::set_spec`].
+pub fn default_accept() -> HotkeySpec {
+    HotkeySpec {
+        ctrl: false,
+        shift: false,
+        alt: false,
+        meta: false,
+        key: "TAB".to_string(),
+    }
+}
+
+/// Create a linked intercept control/handle pair seeded with `initial`.
+pub fn intercept_channel(initial: HotkeySpec) -> (InterceptControl, InterceptHandle) {
+    let active = Arc::new(AtomicBool::new(false));
+    let spec = Arc::new(Mutex::new(initial));
+    let (tx, rx) = crossbeam_channel::unbounded();
+    (
+        InterceptControl {
+            active: active.clone(),
+            spec: spec.clone(),
+            cmds: rx,
+        },
+        InterceptHandle {
+            active,
+            spec,
+            cmds: tx,
+        },
+    )
+}
+
+/// What an armed "press a key" capture will assign.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureTarget {
+    /// The manual-conversion hotkey.
+    ConvertHotkey,
+    /// The autocomplete accept key.
+    AcceptKey,
+}
+
+// AtomicU8 encoding of `Option<CaptureTarget>` for the shared capturing flag.
+const CAPTURE_NONE: u8 = 0;
+const CAPTURE_CONVERT: u8 = 1;
+const CAPTURE_ACCEPT: u8 = 2;
+
 /// Shared with the capture backend: the current hotkey, a "capture the next key"
-/// flag, and a channel to report a newly captured hotkey back to the app.
+/// flag, and a channel to report a newly captured key back to the app.
 #[derive(Clone)]
 pub struct HotkeyControl {
     spec: Arc<Mutex<HotkeySpec>>,
-    capturing: Arc<AtomicBool>,
-    updates: Sender<HotkeySpec>,
+    capturing: Arc<AtomicU8>,
+    updates: Sender<(CaptureTarget, HotkeySpec)>,
 }
 
 impl HotkeyControl {
@@ -76,39 +230,50 @@ impl HotkeyControl {
     pub fn current(&self) -> HotkeySpec {
         self.spec.lock().unwrap().clone()
     }
-    /// True while waiting to capture the next keypress as the new hotkey.
+    /// True while waiting to capture the next keypress (for either target).
     pub fn is_capturing(&self) -> bool {
-        self.capturing.load(Ordering::SeqCst)
+        self.capturing.load(Ordering::SeqCst) != CAPTURE_NONE
     }
-    /// Backend records a captured hotkey: update the live spec, stop capturing,
-    /// and report it so the app can persist it.
+    /// Backend records a captured key: stop capturing, update the live convert
+    /// spec when that was the target, and report it so the app can persist it.
+    /// (The accept spec lives in `InterceptHandle`; the app applies it there.)
     pub fn record(&self, spec: HotkeySpec) {
-        *self.spec.lock().unwrap() = spec.clone();
-        self.capturing.store(false, Ordering::SeqCst);
-        let _ = self.updates.send(spec);
+        let target = match self.capturing.swap(CAPTURE_NONE, Ordering::SeqCst) {
+            CAPTURE_CONVERT => CaptureTarget::ConvertHotkey,
+            CAPTURE_ACCEPT => CaptureTarget::AcceptKey,
+            _ => return,
+        };
+        if target == CaptureTarget::ConvertHotkey {
+            *self.spec.lock().unwrap() = spec.clone();
+        }
+        let _ = self.updates.send((target, spec));
     }
 }
 
-/// App-side handle: start capture and receive the chosen hotkey.
+/// App-side handle: start capture and receive the chosen key.
 pub struct HotkeyHandle {
-    capturing: Arc<AtomicBool>,
-    updates: Receiver<HotkeySpec>,
+    capturing: Arc<AtomicU8>,
+    updates: Receiver<(CaptureTarget, HotkeySpec)>,
 }
 
 impl HotkeyHandle {
-    /// Arm capture: the next keypress becomes the new hotkey.
-    pub fn begin_capture(&self) {
-        self.capturing.store(true, Ordering::SeqCst);
+    /// Arm capture: the next keypress is assigned to `target`.
+    pub fn begin_capture(&self, target: CaptureTarget) {
+        let code = match target {
+            CaptureTarget::ConvertHotkey => CAPTURE_CONVERT,
+            CaptureTarget::AcceptKey => CAPTURE_ACCEPT,
+        };
+        self.capturing.store(code, Ordering::SeqCst);
     }
-    /// Channel of newly captured hotkeys (for the engine's select loop).
-    pub fn updates(&self) -> &Receiver<HotkeySpec> {
+    /// Channel of newly captured keys (for the engine's select loop).
+    pub fn updates(&self) -> &Receiver<(CaptureTarget, HotkeySpec)> {
         &self.updates
     }
 }
 
 /// Create a linked control/handle pair seeded with `initial`.
 pub fn hotkey_channel(initial: HotkeySpec) -> (HotkeyControl, HotkeyHandle) {
-    let capturing = Arc::new(AtomicBool::new(false));
+    let capturing = Arc::new(AtomicU8::new(CAPTURE_NONE));
     let (tx, rx) = crossbeam_channel::unbounded();
     (
         HotkeyControl {

@@ -58,6 +58,15 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
                     ..Default::default()
                 }
                 .into(),
+                CheckmarkItem {
+                    label: "Autocomplete".into(),
+                    checked: self.status.autocomplete,
+                    activate: Box::new(|t: &mut AppTray| {
+                        let _ = t.cmd_tx.send(Command::ToggleAutocomplete);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
                 MenuItem::Separator,
                 StandardItem {
                     label: if self.status.capturing {
@@ -68,6 +77,19 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
                     enabled: !self.status.capturing,
                     activate: Box::new(|t: &mut AppTray| {
                         let _ = t.cmd_tx.send(Command::SetHotkey);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: if self.status.capturing {
+                        "Press a key…".into()
+                    } else {
+                        format!("Change accept key (now: {})", self.status.accept_key)
+                    },
+                    enabled: !self.status.capturing,
+                    activate: Box::new(|t: &mut AppTray| {
+                        let _ = t.cmd_tx.send(Command::SetAcceptKey);
                     }),
                     ..Default::default()
                 }
@@ -109,6 +131,8 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
             autocorrect: true,
             hotkey: "Pause".into(),
             capturing: false,
+            autocomplete: true,
+            accept_key: "Tab".into(),
         },
     };
     let handle = match tray.spawn() {

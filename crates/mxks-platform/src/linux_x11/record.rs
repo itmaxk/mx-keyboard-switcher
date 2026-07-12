@@ -21,7 +21,7 @@ use x11rb::rust_connection::RustConnection;
 use super::keymap::{self, KC_BACKSPACE};
 use super::suppress::Suppress;
 use crate::event::{KeyEvent, KeyKind};
-use crate::HotkeyControl;
+use crate::{HotkeyControl, InterceptControl};
 use mxks_core::hotkey::HotkeySpec;
 
 /// RECORD reply category for data coming from the server.
@@ -36,6 +36,7 @@ const SUPER: u16 = 1 << 6; // Mod4
 pub struct X11Capture {
     suppress: Suppress,
     hotkey: HotkeyControl,
+    intercept: InterceptControl,
     /// Cached keymap for keycode → keysym resolution (named keys only; stable).
     keysyms: Vec<u32>,
     per: usize,
@@ -51,10 +52,11 @@ struct Mods {
 }
 
 impl X11Capture {
-    pub fn new(suppress: Suppress, hotkey: HotkeyControl) -> Self {
+    pub fn new(suppress: Suppress, hotkey: HotkeyControl, intercept: InterceptControl) -> Self {
         X11Capture {
             suppress,
             hotkey,
+            intercept,
             keysyms: Vec::new(),
             per: 0,
             min_keycode: 8,
@@ -145,8 +147,7 @@ impl X11Capture {
         })
     }
 
-    fn matches_hotkey(&self, name: &Option<String>, m: &Mods) -> bool {
-        let spec = self.hotkey.current();
+    fn matches_spec(spec: &HotkeySpec, name: &Option<String>, m: &Mods) -> bool {
         match name {
             Some(name) => {
                 // Pause carries a phantom Control on many keyboards, so don't
@@ -160,6 +161,10 @@ impl X11Capture {
             }
             None => false,
         }
+    }
+
+    fn matches_hotkey(&self, name: &Option<String>, m: &Mods) -> bool {
+        Self::matches_spec(&self.hotkey.current(), name, m)
     }
 
     fn classify(&self, keycode: u8, state: u16) -> Option<KeyKind> {
@@ -208,6 +213,17 @@ impl X11Capture {
             return Ok(());
         }
 
+        // While the accept key is grabbed (suggestion visible), XRecord still
+        // records the grabbed press; the intercept thread already delivered it
+        // as `Accept`, so drop it here to avoid double handling.
+        if self.intercept.is_active() {
+            let m = Self::mods(state);
+            let name = self.name_of(keycode);
+            if Self::matches_spec(&self.intercept.current(), &name, &m) {
+                return Ok(());
+            }
+        }
+
         // Capture mode: record the next sensible key as the new hotkey.
         if self.hotkey.is_capturing() {
             let m = Self::mods(state);
@@ -233,6 +249,10 @@ impl crate::KeyCapture for X11Capture {
     fn run(&mut self, tx: Sender<KeyEvent>) -> Result<()> {
         self.load_keymap()
             .context("loading keymap for hotkey names")?;
+
+        // Accept-key interception (XGrabKey) runs on its own thread; it idles
+        // until the engine activates it for a visible suggestion.
+        super::intercept::spawn(self.intercept.clone(), tx.clone());
 
         let (ctrl_conn, _) = RustConnection::connect(None).context("RECORD control connection")?;
         let (data_conn, _) = RustConnection::connect(None).context("RECORD data connection")?;

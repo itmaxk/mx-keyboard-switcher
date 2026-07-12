@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use mxks_core::hotkey;
-use mxks_platform::KeyEvent;
+use mxks_platform::{KeyEvent, OverlayCmd};
 
 use crate::corrector::Corrector;
 use crate::engine::{Command, Engine, Status};
@@ -48,11 +48,33 @@ fn run() -> Result<()> {
         }
     });
 
+    // Overlay runs on its own thread; the engine only sends non-blocking
+    // commands. On platforms without an overlay (available() == false) the
+    // engine never computes suggestions.
+    let overlay_available = backend.overlay.available();
+    let (overlay_tx, overlay_rx) = crossbeam_channel::unbounded::<OverlayCmd>();
+    let mut overlay = backend.overlay;
+    std::thread::spawn(move || {
+        if let Err(e) = overlay.run(overlay_rx) {
+            tracing::error!("overlay stopped: {e:#}");
+        }
+    });
+
+    // Seed the accept-key spec from config before it moves into the engine.
+    match hotkey::parse(&config.autocomplete.accept_key) {
+        Some(accept) => backend.intercept.set_spec(accept),
+        None => tracing::warn!(
+            "invalid autocomplete accept_key {:?}; keeping default Tab",
+            config.autocomplete.accept_key
+        ),
+    }
+
     tray::start(cmd_tx, status_rx);
 
     let corrector = Corrector::new(backend.injector, backend.layout);
     let mut app = Engine::new(config, corrector, backend.focus, backend.hotkey)
-        .with_status_channel(status_tx);
+        .with_status_channel(status_tx)
+        .with_autocomplete(overlay_tx, backend.intercept, overlay_available);
 
     tracing::info!("MX Keyboard Switcher running");
     app.run(key_rx, cmd_rx);

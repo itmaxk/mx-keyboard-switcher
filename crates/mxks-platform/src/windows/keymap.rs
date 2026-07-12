@@ -88,6 +88,8 @@ pub fn vk_name(vk: u16) -> Option<String> {
         0x5D => "MENU",
         0x14 => "CAPSLOCK",
         0x20 => "SPACE",
+        0x09 => "TAB",
+        0x0D => "ENTER",
         0x70 => "F1",
         0x71 => "F2",
         0x72 => "F3",

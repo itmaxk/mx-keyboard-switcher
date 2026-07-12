@@ -18,7 +18,7 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 use x11rb::NONE;
 
-use super::keymap::{self, KC_BACKSPACE, KC_SHIFT, KC_SPACE};
+use super::keymap::{self, KC_BACKSPACE, KC_SHIFT, KC_SPACE, KC_TAB};
 use super::suppress::Suppress;
 
 pub struct X11Injector {
@@ -93,6 +93,12 @@ impl crate::KeyInjector for X11Injector {
         for c in text.chars() {
             self.tap_char(c)?;
         }
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn tab(&mut self) -> Result<()> {
+        self.tap_key(KC_TAB, false)?;
         self.conn.flush()?;
         Ok(())
     }

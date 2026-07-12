@@ -14,6 +14,9 @@ pub const KC_BACKSPACE: u8 = 14 + X_OFFSET;
 /// X11 keycode of Space (evdev KEY_SPACE = 57).
 pub const KC_SPACE: u8 = 57 + X_OFFSET;
 
+/// X11 keycode of Tab (evdev KEY_TAB = 15).
+pub const KC_TAB: u8 = 15 + X_OFFSET;
+
 /// X11 keycode of Left Shift (evdev KEY_LEFTSHIFT = 42).
 pub const KC_SHIFT: u8 = 42 + X_OFFSET;
 
@@ -125,6 +128,8 @@ pub fn named_keysym(sym: u32) -> Option<&'static str> {
         0xff67 => "MENU",                                    // Menu
         0xffe5 => "CAPSLOCK",                                // Caps_Lock
         0x0020 => "SPACE",                                   // space
+        0xff09 => "TAB",                                     // Tab
+        0xff0d => "ENTER",                                   // Return
         0xffbe..=0xffc9 => return f_name(sym - 0xffbe + 1),  // F1..F12
         0xffca..=0xffe0 => return f_name(sym - 0xffca + 13), // F13..
         _ => return None,

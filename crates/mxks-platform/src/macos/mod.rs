@@ -20,12 +20,17 @@ pub const MAGIC: i64 = 0x4B42_5357; // "KBSW"
 
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
     let (control, handle) = crate::hotkey_channel(hotkey);
+    let (icontrol, ihandle) = crate::intercept_channel(crate::default_accept());
     Ok(Backend {
-        capture: Box::new(tap::MacCapture::new(control)),
+        capture: Box::new(tap::MacCapture::new(control, icontrol)),
         injector: Box::new(inject::MacInjector::new()?),
         layout: Box::new(layout::MacLayout),
         focus: Box::new(MacFocus),
         hotkey: handle,
+        intercept: ihandle,
+        // No overlay on macOS yet (needs an NSPanel via objc2); the stub keeps
+        // autocomplete inert here.
+        overlay: Box::new(crate::StubOverlay),
     })
 }
 

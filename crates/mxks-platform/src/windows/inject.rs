@@ -5,7 +5,7 @@
 use anyhow::{bail, Result};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    VIRTUAL_KEY, VK_BACK,
+    VIRTUAL_KEY, VK_BACK, VK_TAB,
 };
 
 use super::MAGIC;
@@ -58,5 +58,12 @@ impl crate::KeyInjector for WinInjector {
             send(&inputs)?;
         }
         Ok(())
+    }
+
+    fn tab(&mut self) -> Result<()> {
+        send(&[
+            key_input(VK_TAB.0, 0, 0),
+            key_input(VK_TAB.0, 0, KEYEVENTF_KEYUP.0),
+        ])
     }
 }

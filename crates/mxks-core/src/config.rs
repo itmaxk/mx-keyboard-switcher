@@ -12,6 +12,7 @@ pub struct Config {
     pub detection: Detection,
     pub exclusions: Exclusions,
     pub dictionary: Dictionary,
+    pub autocomplete: Autocomplete,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +57,19 @@ pub struct Dictionary {
     pub extra_ru: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Autocomplete {
+    /// Master switch for inline word suggestions.
+    pub enabled: bool,
+    /// Key that inserts the suggested completion. Examples: "Tab", "F8".
+    pub accept_key: String,
+    /// Minimum typed letters before a suggestion is shown.
+    pub min_prefix: usize,
+    /// Minimum letters the completion must add to be worth showing.
+    pub min_remainder: usize,
+}
+
 impl Default for General {
     fn default() -> Self {
         General {
@@ -76,6 +90,17 @@ impl Default for Hotkeys {
 impl Default for Detection {
     fn default() -> Self {
         Detection { threshold: 3.0 }
+    }
+}
+
+impl Default for Autocomplete {
+    fn default() -> Self {
+        Autocomplete {
+            enabled: true,
+            accept_key: "Tab".to_string(),
+            min_prefix: 3,
+            min_remainder: 1,
+        }
     }
 }
 
@@ -114,6 +139,16 @@ words = []
 # Extra words treated as valid so they are never "corrected".
 extra_en = []
 extra_ru = []
+
+[autocomplete]
+# Suggest word completions while typing (shown in a small gray overlay).
+enabled = true
+# Key that inserts the suggested completion. Examples: "Tab", "F8".
+accept_key = "Tab"
+# Minimum typed letters before a suggestion is shown.
+min_prefix = 3
+# Minimum letters the completion must add to be worth showing.
+min_remainder = 1
 "#;
 
 #[cfg(test)]
@@ -139,6 +174,16 @@ mod tests {
         let c = Config::from_toml(DEFAULT_TEMPLATE).unwrap();
         assert_eq!(c.detection.threshold, 3.0);
         assert!(c.exclusions.apps.iter().any(|a| a == "keepassxc"));
+        assert!(c.autocomplete.enabled);
+        assert_eq!(c.autocomplete.accept_key, "Tab");
+        assert_eq!(c.autocomplete.min_prefix, 3);
+    }
+
+    #[test]
+    fn autocomplete_partial_override() {
+        let c = Config::from_toml("[autocomplete]\nenabled = false\n").unwrap();
+        assert!(!c.autocomplete.enabled);
+        assert_eq!(c.autocomplete.accept_key, "Tab");
     }
 
     #[test]

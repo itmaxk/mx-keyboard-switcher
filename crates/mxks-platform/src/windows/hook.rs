@@ -4,9 +4,10 @@
 //! global set before the hook is installed. Injected events (tagged with
 //! `dwExtraInfo == MAGIC`) are ignored here, which is race-free.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
-use crate::HotkeyControl;
+use crate::{HotkeyControl, InterceptControl};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use mxks_core::hotkey::HotkeySpec;
@@ -15,8 +16,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN,
-    WM_SYSKEYDOWN,
+    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use super::keymap;
@@ -33,17 +34,23 @@ const VK_RWIN: i32 = 0x5C;
 struct Shared {
     tx: Sender<KeyEvent>,
     hotkey: HotkeyControl,
+    intercept: InterceptControl,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
 
+/// VK whose next key-up must be swallowed (we ate its key-down as `Accept`);
+/// 0 when none. Keeps apps from seeing an orphan key-up.
+static SWALLOW_UP_VK: AtomicU32 = AtomicU32::new(0);
+
 pub struct WinCapture {
     hotkey: HotkeyControl,
+    intercept: InterceptControl,
 }
 
 impl WinCapture {
-    pub fn new(hotkey: HotkeyControl) -> Self {
-        WinCapture { hotkey }
+    pub fn new(hotkey: HotkeyControl, intercept: InterceptControl) -> Self {
+        WinCapture { hotkey, intercept }
     }
 }
 
@@ -109,8 +116,7 @@ fn capture_spec(kb: &KBDLLHOOKSTRUCT, m: &Mods) -> Option<HotkeySpec> {
     })
 }
 
-fn matches_hotkey(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> bool {
-    let spec = shared.hotkey.current();
+fn matches_spec(spec: &HotkeySpec, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> bool {
     match name_of(kb) {
         Some(name) => {
             let ignore_ctrl = name.eq_ignore_ascii_case("PAUSE");
@@ -122,6 +128,10 @@ fn matches_hotkey(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> bool {
         }
         None => false,
     }
+}
+
+fn matches_hotkey(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> bool {
+    matches_spec(&shared.hotkey.current(), kb, m)
 }
 
 fn classify(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> Option<KeyKind> {
@@ -163,6 +173,19 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                 if let Some(shared) = SHARED.get() {
                     let m = current_mods();
+                    // Accept-key interception: swallow the key while a
+                    // suggestion is visible (single atomic load when idle).
+                    if shared.intercept.is_active()
+                        && matches_spec(&shared.intercept.current(), kb, &m)
+                    {
+                        let _ = shared.tx.send(KeyEvent {
+                            kind: KeyKind::Accept,
+                            down: true,
+                            injected: false,
+                        });
+                        SWALLOW_UP_VK.store(kb.vkCode, Ordering::SeqCst);
+                        return LRESULT(1);
+                    }
                     if shared.hotkey.is_capturing() {
                         if let Some(spec) = capture_spec(kb, &m) {
                             shared.hotkey.record(spec);
@@ -175,6 +198,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                         });
                     }
                 }
+            } else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+                && kb.vkCode != 0
+                && SWALLOW_UP_VK.load(Ordering::SeqCst) == kb.vkCode
+            {
+                SWALLOW_UP_VK.store(0, Ordering::SeqCst);
+                return LRESULT(1);
             }
         }
     }
@@ -186,6 +215,7 @@ impl crate::KeyCapture for WinCapture {
         let _ = SHARED.set(Shared {
             tx,
             hotkey: self.hotkey.clone(),
+            intercept: self.intercept.clone(),
         });
 
         unsafe {

@@ -14,6 +14,9 @@ use super::MAGIC;
 /// macOS virtual keycode for Delete/Backspace.
 const KEYCODE_DELETE: u16 = 51;
 
+/// macOS virtual keycode for Tab.
+const KEYCODE_TAB: u16 = 48;
+
 pub struct MacInjector;
 
 impl MacInjector {
@@ -60,6 +63,17 @@ impl crate::KeyInjector for MacInjector {
                 Self::tag(&event);
                 event.post(CGEventTapLocation::HID);
             }
+        }
+        Ok(())
+    }
+
+    fn tab(&mut self) -> Result<()> {
+        let source = Self::source()?;
+        for down in [true, false] {
+            let event = CGEvent::new_keyboard_event(source.clone(), KEYCODE_TAB, down)
+                .map_err(|_| anyhow!("failed to create keyboard event"))?;
+            Self::tag(&event);
+            event.post(CGEventTapLocation::HID);
         }
         Ok(())
     }

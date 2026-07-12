@@ -130,11 +130,12 @@ fn capture_reassigns_hotkey() {
     std::thread::sleep(Duration::from_millis(300));
 
     // Arm capture and press Scroll_Lock (keycode 78 on this server).
-    hotkey.begin_capture();
+    hotkey.begin_capture(mxks_platform::CaptureTarget::ConvertHotkey);
     let mut assigned = None;
     for _ in 0..30 {
         raw_tap(78); // Scroll_Lock
-        if let Ok(spec) = hotkey.updates().recv_timeout(Duration::from_millis(100)) {
+        if let Ok((target, spec)) = hotkey.updates().recv_timeout(Duration::from_millis(100)) {
+            assert_eq!(target, mxks_platform::CaptureTarget::ConvertHotkey);
             assigned = Some(spec);
             break;
         }
@@ -245,4 +246,120 @@ fn injected_input_is_suppressed() {
         leaked.is_empty(),
         "injected events leaked to capture: {leaked:?}"
     );
+}
+
+/// Validate the accept-key **grab strategy** directly against the X server:
+/// grabbing the accept key with its base modifier mask plus the CapsLock/NumLock
+/// lock variants (never `AnyModifier`) must catch a bare accept-key press yet
+/// leave modifier chords like Shift+Tab with the focused application — the exact
+/// property that keeps Alt+Tab/Shift+Tab working while a suggestion is shown.
+///
+/// This exercises the grab semantics that `linux_x11::intercept` relies on,
+/// deterministically (holding Shift and confirming the server sees it before
+/// tapping Tab), without the RECORD/injection timing races of the full backend.
+#[test]
+#[ignore = "requires a live X server"]
+fn accept_grab_masks_spare_shift_tab() {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        ConnectionExt as _, GrabMode, KeyButMask, ModMask, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+    };
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    use x11rb::protocol::Event;
+    use x11rb::rust_connection::RustConnection;
+
+    const TAB: u8 = 23;
+    const SHIFT_L: u8 = 50;
+    // Base mask 0 (Tab has no modifiers) + CapsLock/NumLock variants, matching
+    // `intercept::LOCK_VARIANTS`. Never AnyModifier.
+    const LOCK_VARIANTS: [u16; 4] = [0, 0b10 /*Lock*/, 0b1_0000 /*Mod2*/, 0b1_0010];
+
+    let (grab, screen) = RustConnection::connect(None).expect("grab conn");
+    let root = grab.setup().roots[screen].root;
+    for lock in LOCK_VARIANTS {
+        grab.grab_key(
+            false,
+            root,
+            ModMask::from(lock),
+            TAB,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )
+        .expect("grab_key request")
+        .check()
+        .unwrap_or_else(|e| panic!("grab_key lock {lock:#b} failed: {e}"));
+    }
+    grab.flush().expect("flush grabs");
+    std::thread::sleep(Duration::from_millis(150));
+
+    let count_grabbed_presses = |timeout_ms: u64| -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut n = 0;
+        while std::time::Instant::now() < deadline {
+            while let Some(ev) = grab.poll_for_event().expect("poll") {
+                if let Event::KeyPress(_) = ev {
+                    n += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        n
+    };
+    // Discard anything queued from setup.
+    let _ = count_grabbed_presses(50);
+
+    let (inj, _) = RustConnection::connect(None).expect("inject conn");
+
+    // Bare Tab must be delivered to the grabbing client (the swallow).
+    inj.xtest_fake_input(KEY_PRESS_EVENT, TAB, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    inj.xtest_fake_input(KEY_RELEASE_EVENT, TAB, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    inj.flush().unwrap();
+    assert_eq!(
+        count_grabbed_presses(300),
+        1,
+        "bare Tab was not caught by the accept-key grab"
+    );
+
+    // Shift+Tab must NOT be caught: hold Shift, confirm the server reports it,
+    // then tap Tab so the grab is evaluated against a real Shift modifier state.
+    inj.xtest_fake_input(KEY_PRESS_EVENT, SHIFT_L, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    inj.flush().unwrap();
+    let mut shift_seen = false;
+    for _ in 0..50 {
+        if inj
+            .query_pointer(root)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .mask
+            .contains(KeyButMask::SHIFT)
+        {
+            shift_seen = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(shift_seen, "could not establish a held Shift state");
+    inj.xtest_fake_input(KEY_PRESS_EVENT, TAB, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    inj.xtest_fake_input(KEY_RELEASE_EVENT, TAB, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    inj.flush().unwrap();
+    let shifted = count_grabbed_presses(300);
+    inj.xtest_fake_input(KEY_RELEASE_EVENT, SHIFT_L, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    inj.flush().unwrap();
+    assert_eq!(
+        shifted, 0,
+        "Shift+Tab was wrongly caught by the accept-key grab (mask would steal the chord)"
+    );
+
+    // Ungrab so the server is left clean.
+    for lock in LOCK_VARIANTS {
+        let _ = grab.ungrab_key(TAB, root, ModMask::from(lock));
+    }
+    let _ = grab.flush();
 }

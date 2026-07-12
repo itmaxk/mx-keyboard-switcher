@@ -91,6 +91,8 @@ pub fn named_keycode(keycode: u16) -> Option<&'static str> {
         0x6B => "F14",
         0x71 => "F15",
         0x31 => "SPACE",
+        0x30 => "TAB",
+        0x24 => "ENTER",
         0x73 => "HOME",
         0x77 => "END",
         0x74 => "PAGEUP",

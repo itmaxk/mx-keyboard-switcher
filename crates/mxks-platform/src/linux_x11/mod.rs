@@ -3,7 +3,9 @@
 //! a Wayland session we require XWayland (a set `DISPLAY`) and warn.
 
 mod inject;
+mod intercept;
 mod keymap;
+pub(crate) mod overlay;
 mod record;
 mod suppress;
 mod xkb;
@@ -23,11 +25,12 @@ pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
 
     let suppress = Suppress::new();
     let (control, handle) = crate::hotkey_channel(hotkey);
+    let (icontrol, ihandle) = crate::intercept_channel(crate::default_accept());
 
     let injector = inject::X11Injector::new(suppress.clone())?;
     let layout = XkbSwitcher(xkb::XkbLayout::new()?);
     let focus = LinuxFocus::new()?;
-    let capture = record::X11Capture::new(suppress, control);
+    let capture = record::X11Capture::new(suppress, control, icontrol);
 
     Ok(Backend {
         capture: Box::new(capture),
@@ -35,6 +38,8 @@ pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
         layout: Box::new(layout),
         focus: Box::new(focus),
         hotkey: handle,
+        intercept: ihandle,
+        overlay: Box::new(overlay::X11Overlay::new()),
     })
 }
 

@@ -6,6 +6,7 @@ mod hook;
 mod inject;
 mod keymap;
 mod layout;
+mod overlay;
 
 use anyhow::Result;
 use mxks_core::hotkey::HotkeySpec;
@@ -17,12 +18,15 @@ pub const MAGIC: usize = 0x4B42_5357; // "KBSW"
 
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
     let (control, handle) = crate::hotkey_channel(hotkey);
+    let (icontrol, ihandle) = crate::intercept_channel(crate::default_accept());
     Ok(Backend {
-        capture: Box::new(hook::WinCapture::new(control)),
+        capture: Box::new(hook::WinCapture::new(control, icontrol)),
         injector: Box::new(inject::WinInjector),
         layout: Box::new(layout::WinLayout),
         focus: Box::new(WinFocus),
         hotkey: handle,
+        intercept: ihandle,
+        overlay: Box::new(overlay::WinOverlay),
     })
 }
 
