@@ -45,6 +45,37 @@ fn raw_key(x_keycode: u8, press: bool) {
     conn.flush().unwrap();
 }
 
+/// Resolve the keycode currently mapped to `keysym`; live servers differ
+/// (e.g. Pause is keycode 110 on the xrdp desktop but 127 on Xvfb).
+fn keycode_of(keysym: u32) -> u8 {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+    let (conn, _) = RustConnection::connect(None).unwrap();
+    let min = conn.setup().min_keycode;
+    let max = conn.setup().max_keycode;
+    let reply = conn
+        .get_keyboard_mapping(min, max - min + 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    for (i, syms) in reply
+        .keysyms
+        .chunks(reply.keysyms_per_keycode as usize)
+        .enumerate()
+    {
+        if syms.contains(&keysym) {
+            return min + i as u8;
+        }
+    }
+    panic!("no keycode maps keysym {keysym:#x} on this server");
+}
+
+const XK_PAUSE: u32 = 0xff13;
+const XK_SCROLL_LOCK: u32 = 0xff14;
+const XK_CONTROL_L: u32 = 0xffe3;
+const XK_G: u32 = 0x0067;
+
 /// These tests inject raw XTEST events that the X server delivers to whatever
 /// window currently has focus. On a shared desktop display that means phantom
 /// Shift+Tab / Ctrl+C / letters landing in the user's terminals. Refuse to run
@@ -74,12 +105,14 @@ fn pause_with_phantom_control_fires() {
     });
     std::thread::sleep(Duration::from_millis(300));
 
+    let ctrl = keycode_of(XK_CONTROL_L);
+    let pause = keycode_of(XK_PAUSE);
     let mut saw_hotkey = false;
     let mut saw_reset = false;
     for _ in 0..30 {
-        raw_key(37, true); // Control_L down (phantom)
-        raw_tap(110); // Pause (state now includes Control)
-        raw_key(37, false); // Control_L up
+        raw_key(ctrl, true); // Control down (phantom)
+        raw_tap(pause); // Pause (state now includes Control)
+        raw_key(ctrl, false); // Control up
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
             match ev.kind {
                 KeyKind::Hotkey => saw_hotkey = true,
@@ -114,9 +147,10 @@ fn pause_triggers_hotkey() {
     });
     std::thread::sleep(Duration::from_millis(300));
 
+    let pause = keycode_of(XK_PAUSE);
     let mut saw_hotkey = false;
     for _ in 0..30 {
-        raw_tap(110); // Pause on this server
+        raw_tap(pause);
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
             if ev.kind == KeyKind::Hotkey {
                 saw_hotkey = true;
@@ -147,11 +181,12 @@ fn capture_reassigns_hotkey() {
     });
     std::thread::sleep(Duration::from_millis(300));
 
-    // Arm capture and press Scroll_Lock (keycode 78 on this server).
+    // Arm capture and press Scroll_Lock.
+    let scroll_lock = keycode_of(XK_SCROLL_LOCK);
     hotkey.begin_capture(mxks_platform::CaptureTarget::ConvertHotkey);
     let mut assigned = None;
     for _ in 0..30 {
-        raw_tap(78); // Scroll_Lock
+        raw_tap(scroll_lock);
         if let Ok((target, spec)) = hotkey.updates().recv_timeout(Duration::from_millis(100)) {
             assert_eq!(target, mxks_platform::CaptureTarget::ConvertHotkey);
             assigned = Some(spec);
@@ -164,7 +199,7 @@ fn capture_reassigns_hotkey() {
     // Now Scroll_Lock should fire the hotkey (no longer swallowed by capture).
     let mut saw_hotkey = false;
     for _ in 0..30 {
-        raw_tap(78);
+        raw_tap(scroll_lock);
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
             if ev.kind == KeyKind::Hotkey {
                 saw_hotkey = true;
@@ -219,9 +254,10 @@ fn capture_reports_physical_key() {
 
     // Tap repeatedly and poll: the very first taps can race RECORD enabling, so
     // we retry for up to ~3s rather than relying on a single synthesized event.
+    let g = keycode_of(XK_G);
     let mut saw_g = false;
     for _ in 0..30 {
-        raw_tap(42); // evdev KEY_G (34) + 8
+        raw_tap(g);
         while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
             if let KeyKind::Letter {
                 key: PhysKey::G, ..
