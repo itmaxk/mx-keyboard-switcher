@@ -411,6 +411,21 @@ fn accept_grab_masks_spare_shift_tab() {
     inj.xtest_fake_input(KEY_RELEASE_EVENT, SHIFT_L, 0, x11rb::NONE, 0, 0, 0)
         .unwrap();
     inj.flush().unwrap();
+    // Wait until the server confirms Shift cleared; otherwise the release can
+    // race our disconnect and later tests see key events with Shift stuck on.
+    for _ in 0..50 {
+        if !inj
+            .query_pointer(root)
+            .unwrap()
+            .reply()
+            .unwrap()
+            .mask
+            .contains(KeyButMask::SHIFT)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
         shifted, 0,
         "Shift+Tab was wrongly caught by the accept-key grab (mask would steal the chord)"
