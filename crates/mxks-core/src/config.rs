@@ -11,6 +11,7 @@ pub struct Config {
     pub hotkeys: Hotkeys,
     pub detection: Detection,
     pub exclusions: Exclusions,
+    pub terminals: Terminals,
     pub dictionary: Dictionary,
     pub autocomplete: Autocomplete,
 }
@@ -47,11 +48,26 @@ pub struct Exclusions {
     /// managers).
     pub apps: Vec<String>,
     /// App-name substrings where automatic correction and suggestions are off
-    /// but the manual conversion hotkey still works on demand (e.g. terminals,
-    /// where shell commands must not be auto-rewritten).
+    /// but the manual conversion hotkey still works on demand. Terminals have
+    /// their own `[terminals]` section; this is for any other manual-only apps.
     pub manual_only: Vec<String>,
     /// Typed forms that must never be auto-corrected.
     pub words: Vec<String>,
+}
+
+/// Terminals get their own tier: manual-only by default (shell commands must not
+/// be auto-rewritten), with an opt-in to full auto and their own accept key so
+/// the global `accept_key` can be Tab without stealing shell Tab-completion.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Terminals {
+    /// App-name substrings (WM_CLASS, lowercased) treated as terminals.
+    pub apps: Vec<String>,
+    /// false = manual-only (auto off, hotkey works). true = full auto.
+    pub auto: bool,
+    /// Autocomplete accept key used inside terminals (when `auto` is true), kept
+    /// separate from the global accept key so Tab stays free for the shell.
+    pub accept_key: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -110,6 +126,30 @@ impl Default for Autocomplete {
     }
 }
 
+impl Default for Terminals {
+    fn default() -> Self {
+        Terminals {
+            apps: [
+                "ptyxis",
+                "gnome-terminal",
+                "xterm",
+                "konsole",
+                "alacritty",
+                "kitty",
+                "terminator",
+                "xfce4-terminal",
+                "tilix",
+                "wezterm",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            auto: false,
+            accept_key: "Right".to_string(),
+        }
+    }
+}
+
 impl Config {
     /// Parse from TOML text. On error the caller should keep the previous config.
     pub fn from_toml(text: &str) -> Result<Config, toml::de::Error> {
@@ -139,13 +179,22 @@ threshold = 3.0
 # App-name substrings (WM_CLASS, lowercased) where the switcher is FULLY off —
 # no automatic correction/suggestions and no manual hotkey (password managers).
 apps = ["keepassxc", "1password", "bitwarden"]
-# App-name substrings where AUTOMATIC correction and suggestions are off but the
-# manual conversion hotkey still works on demand. Terminals live here because
-# shell commands are not dictionary words: auto-"correcting" them rewrites your
-# command line (and leaves the system layout switched to Russian).
-manual_only = ["ptyxis", "gnome-terminal", "konsole", "xterm", "alacritty", "kitty", "terminator", "xfce4-terminal", "tilix", "wezterm"]
+# Extra manual-only apps (auto off, hotkey works). Terminals are configured in
+# their own [terminals] section, so this is usually empty.
+manual_only = []
 # Typed forms that must never be auto-corrected.
 words = []
+
+[terminals]
+# App-name substrings (WM_CLASS, lowercased) treated as terminals.
+apps = ["ptyxis", "gnome-terminal", "konsole", "xterm", "alacritty", "kitty", "terminator", "xfce4-terminal", "tilix", "wezterm"]
+# false (default): manual-only — auto-correct and suggestions are OFF (shell
+#   commands are never rewritten), but the Pause hotkey still converts on demand.
+# true: full auto, like any other app (uses accept_key below for suggestions).
+auto = false
+# Autocomplete accept key used INSIDE terminals when auto = true. Kept separate
+# so the global accept_key can stay Tab without stealing shell Tab-completion.
+accept_key = "Right"
 
 [dictionary]
 # Extra words treated as valid so they are never "corrected".
@@ -186,7 +235,9 @@ mod tests {
         let c = Config::from_toml(DEFAULT_TEMPLATE).unwrap();
         assert_eq!(c.detection.threshold, 3.0);
         assert!(c.exclusions.apps.iter().any(|a| a == "keepassxc"));
-        assert!(c.exclusions.manual_only.iter().any(|a| a == "ptyxis"));
+        assert!(c.terminals.apps.iter().any(|a| a == "ptyxis"));
+        assert!(!c.terminals.auto);
+        assert_eq!(c.terminals.accept_key, "Right");
         assert!(c.autocomplete.enabled);
         assert_eq!(c.autocomplete.accept_key, "Tab");
         assert_eq!(c.autocomplete.min_prefix, 3);
@@ -197,6 +248,19 @@ mod tests {
         // A config without the new key still loads (empty list, not an error).
         let c = Config::from_toml("[exclusions]\napps = [\"keepassxc\"]\n").unwrap();
         assert!(c.exclusions.manual_only.is_empty());
+    }
+
+    #[test]
+    fn terminals_section_parses_and_defaults() {
+        // Terminals default to manual-only with their own accept key.
+        let c = Config::default();
+        assert!(c.terminals.apps.iter().any(|a| a == "ptyxis"));
+        assert!(!c.terminals.auto);
+        // A partial override keeps the rest of the defaults.
+        let c = Config::from_toml("[terminals]\nauto = true\n").unwrap();
+        assert!(c.terminals.auto);
+        assert!(c.terminals.apps.iter().any(|a| a == "ptyxis"));
+        assert_eq!(c.terminals.accept_key, "Right");
     }
 
     #[test]

@@ -96,6 +96,9 @@ pub struct Engine {
     overlay_tx: Option<Sender<OverlayCmd>>,
     /// Toggles accept-key interception in the capture backend.
     intercept: Option<InterceptHandle>,
+    /// The accept-key name currently applied to the intercept, so we only push a
+    /// new spec when it actually changes (terminals may use a different key).
+    active_accept: Option<String>,
     /// False when the platform has no overlay — autocomplete stays inert.
     overlay_available: bool,
 }
@@ -123,6 +126,7 @@ impl Engine {
             suggestion: None,
             overlay_tx: None,
             intercept: None,
+            active_accept: None,
             overlay_available: false,
         }
     }
@@ -204,6 +208,8 @@ impl Engine {
                 if let Some(i) = &self.intercept {
                     i.set_spec(spec);
                 }
+                // The global accept key is now applied; keep the tracker in sync.
+                self.active_accept = Some(shown.clone());
                 if let Err(e) = crate::config_io::save_accept_key(&shown) {
                     tracing::warn!("could not save accept key: {e:#}");
                 }
@@ -263,13 +269,27 @@ impl Engine {
         if self.overlay_tx.is_none() {
             return;
         }
-        let want = self.compute_suggestion();
+        // Suggestions are automatic, so only where the app is fully enabled.
+        let (mode, is_terminal) = self.classify_focus(&self.focus.focused_app());
+        let want = if mode == AppMode::Full {
+            self.compute_suggestion()
+        } else {
+            None
+        };
         if want.is_none() && self.suggestion.is_none() {
             return;
         }
         match &want {
             // Re-send even when unchanged so the hint follows the caret.
             Some(text) => {
+                // Pick the accept key for this app: terminals may use a separate
+                // one so the global Tab does not hijack shell completion.
+                let key = if is_terminal {
+                    self.config.terminals.accept_key.clone()
+                } else {
+                    self.config.autocomplete.accept_key.clone()
+                };
+                self.set_accept_key(&key);
                 self.send_overlay(OverlayCmd::Show { text: text.clone() });
                 self.set_intercept(true);
             }
@@ -291,10 +311,6 @@ impl Engine {
         let prefix = render_keys(&word.keys, word.lang).to_lowercase();
         let prefix_len = prefix.chars().count();
         if prefix_len < ac.min_prefix {
-            return None;
-        }
-        // Suggestions are automatic, so only in fully-enabled apps.
-        if self.app_mode() != AppMode::Full {
             return None;
         }
         let full = mxks_core::dict::complete(&prefix, word.lang)?;
@@ -503,14 +519,17 @@ impl Engine {
             }
             Command::ReloadConfig => {
                 self.config = crate::config_io::load();
-                // Re-apply autocomplete settings: the accept key may have
-                // changed and a visible suggestion may now be stale.
+                // A visible suggestion may now be stale.
                 self.dismiss_suggestion();
-                if let Some(spec) = mxks_core::hotkey::parse(&self.config.autocomplete.accept_key) {
-                    if let Some(i) = &self.intercept {
-                        i.set_spec(spec);
-                    }
+                // Re-apply the convert hotkey (the capture backend reads it live,
+                // so this takes effect without a restart).
+                if let Some(spec) = mxks_core::hotkey::parse(&self.config.hotkeys.convert_last_word)
+                {
+                    self.hotkey.set_spec(spec);
                 }
+                // Force the accept key (global vs terminal) to be re-resolved on
+                // the next suggestion, since it may have changed in the config.
+                self.active_accept = None;
                 tracing::info!("config reloaded");
                 self.broadcast_status();
             }
@@ -548,26 +567,52 @@ impl Engine {
         false
     }
 
-    /// How the switcher should behave in the currently focused application.
-    fn app_mode(&self) -> AppMode {
+    /// Resolve how the switcher behaves in `app` and whether it is a terminal.
+    /// Terminals are manual-only unless `[terminals] auto` is on; they also use a
+    /// separate accept key, hence the returned `is_terminal` flag.
+    fn classify_focus(&self, app: &Option<String>) -> (AppMode, bool) {
         let ex = &self.config.exclusions;
-        if ex.apps.is_empty() && ex.manual_only.is_empty() {
-            return AppMode::Full;
-        }
-        let Some(app) = self.focus.focused_app() else {
-            return AppMode::Full;
+        let terms = &self.config.terminals;
+        let Some(app) = app else {
+            return (AppMode::Full, false);
         };
         let matches = |list: &[String]| {
             list.iter()
                 .any(|e| !e.is_empty() && app.contains(&e.to_lowercase()))
         };
-        // A hard exclusion (Off) wins over a soft one (ManualOnly).
+        // Hard exclusion (Off) wins over everything.
         if matches(&ex.apps) {
-            AppMode::Off
+            (AppMode::Off, false)
+        } else if matches(&terms.apps) {
+            let mode = if terms.auto {
+                AppMode::Full
+            } else {
+                AppMode::ManualOnly
+            };
+            (mode, true)
         } else if matches(&ex.manual_only) {
-            AppMode::ManualOnly
+            (AppMode::ManualOnly, false)
         } else {
-            AppMode::Full
+            (AppMode::Full, false)
+        }
+    }
+
+    /// How the switcher should behave in the currently focused application.
+    fn app_mode(&self) -> AppMode {
+        self.classify_focus(&self.focus.focused_app()).0
+    }
+
+    /// Apply `name` as the intercept's accept key, but only when it changed
+    /// (each change re-grabs the key in the backend).
+    fn set_accept_key(&mut self, name: &str) {
+        if self.active_accept.as_deref() == Some(name) {
+            return;
+        }
+        if let Some(spec) = mxks_core::hotkey::parse(name) {
+            if let Some(i) = &self.intercept {
+                i.set_spec(spec);
+            }
+            self.active_accept = Some(name.to_string());
         }
     }
 
@@ -827,14 +872,15 @@ mod tests {
         ]
     }
 
-    /// A manual-only app (terminal): a Space boundary must NOT auto-correct, but
-    /// the conversion hotkey still converts on demand.
+    /// A manual-only app (via `exclusions.manual_only`): a Space boundary must
+    /// NOT auto-correct, but the conversion hotkey still converts on demand.
     #[test]
     fn manual_only_app_skips_auto_but_allows_hotkey() {
         let mut config = Config::default();
-        config.exclusions.manual_only = vec!["ptyxis".into()];
+        // Use a non-terminal name so this tests the manual_only list itself.
+        config.exclusions.manual_only = vec!["mymanualapp".into()];
         let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let (mut engine, _hk) = mode_engine(config, "ptyxis ptyxis", log.clone());
+        let (mut engine, _hk) = mode_engine(config, "mymanualapp mymanualapp", log.clone());
 
         let (key_tx, key_rx) = crossbeam_channel::unbounded();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
@@ -894,6 +940,104 @@ mod tests {
         engine.run(key_rx, cmd_rx);
 
         assert_eq!(log.lock().unwrap().clone(), expected_ghbdtn_convert());
+    }
+
+    /// Autocomplete-wired engine with a custom config and focused app name.
+    fn autocomplete_engine_cfg(
+        config: Config,
+        app: &str,
+        log: Log,
+    ) -> (
+        Engine,
+        crossbeam_channel::Receiver<OverlayCmd>,
+        mxks_platform::InterceptControl,
+    ) {
+        let corrector = Corrector::new(
+            Box::new(MockInjector(log.clone())),
+            Box::new(MockLayout {
+                log,
+                current: Arc::new(Mutex::new(Lang::En)),
+            }),
+        );
+        let (_hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        let (icontrol, ihandle) = mxks_platform::intercept_channel(mxks_platform::default_accept());
+        let (overlay_tx, overlay_rx) = crossbeam_channel::unbounded();
+        let engine = Engine::new(
+            config,
+            corrector,
+            Box::new(MockFocusApp(app.into())),
+            hk_handle,
+        )
+        .with_autocomplete(overlay_tx, ihandle, true);
+        (engine, overlay_rx, icontrol)
+    }
+
+    /// A terminal defaults to manual-only: typing shows no suggestion and does
+    /// not grab an accept key, but the conversion hotkey still converts.
+    #[test]
+    fn terminal_manual_only_by_default() {
+        let mut config = Config::default();
+        config.terminals.apps = vec!["myterm".into()];
+        config.terminals.auto = false;
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _rx, icontrol) =
+            autocomplete_engine_cfg(config, "myterm myterm", log.clone());
+
+        for k in [PhysKey::H, PhysKey::E, PhysKey::L] {
+            engine.handle_key(letter(k));
+        }
+        assert!(
+            !icontrol.is_active(),
+            "a manual-only terminal must not intercept/suggest"
+        );
+
+        engine.handle_key(hotkey());
+        assert!(
+            !log.lock().unwrap().is_empty(),
+            "the conversion hotkey must still work in a terminal"
+        );
+    }
+
+    /// A terminal with `auto = true` suggests like a full app, but grabs its own
+    /// accept key (Right) instead of the global one (Tab), so shell Tab stays free.
+    #[test]
+    fn terminal_auto_uses_its_own_accept_key() {
+        let mut config = Config::default();
+        config.terminals.apps = vec!["myterm".into()];
+        config.terminals.auto = true;
+        config.terminals.accept_key = "Right".into();
+        config.autocomplete.accept_key = "Tab".into();
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _rx, icontrol) = autocomplete_engine_cfg(config, "myterm myterm", log);
+
+        for k in [PhysKey::H, PhysKey::E, PhysKey::L] {
+            engine.handle_key(letter(k));
+        }
+        assert!(
+            icontrol.is_active(),
+            "terminal auto should show a suggestion"
+        );
+        assert_eq!(
+            icontrol.current().key,
+            "RIGHT",
+            "a terminal must grab its own accept key, not the global Tab"
+        );
+    }
+
+    /// A full (non-terminal) app grabs the global accept key (Tab).
+    #[test]
+    fn full_app_uses_global_accept_key() {
+        let mut config = Config::default();
+        config.autocomplete.accept_key = "Tab".into();
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _rx, icontrol) = autocomplete_engine_cfg(config, "org.some.editor", log);
+
+        for k in [PhysKey::H, PhysKey::E, PhysKey::L] {
+            engine.handle_key(letter(k));
+        }
+        assert!(icontrol.is_active(), "full app should show a suggestion");
+        assert_eq!(icontrol.current().key, "TAB");
     }
 
     /// A mixed-case identifier (interior capital) must not be auto-corrected,

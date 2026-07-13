@@ -250,8 +250,10 @@ impl HotkeyControl {
     }
 }
 
-/// App-side handle: start capture and receive the chosen key.
+/// App-side handle: start capture, receive the chosen key, and push a new
+/// convert hotkey (e.g. on config reload).
 pub struct HotkeyHandle {
+    spec: Arc<Mutex<HotkeySpec>>,
     capturing: Arc<AtomicU8>,
     updates: Receiver<(CaptureTarget, HotkeySpec)>,
 }
@@ -265,6 +267,11 @@ impl HotkeyHandle {
         };
         self.capturing.store(code, Ordering::SeqCst);
     }
+    /// Replace the live convert hotkey (the capture backend reads it per key),
+    /// so a config reload can change it without restarting.
+    pub fn set_spec(&self, spec: HotkeySpec) {
+        *self.spec.lock().unwrap() = spec;
+    }
     /// Channel of newly captured keys (for the engine's select loop).
     pub fn updates(&self) -> &Receiver<(CaptureTarget, HotkeySpec)> {
         &self.updates
@@ -274,14 +281,16 @@ impl HotkeyHandle {
 /// Create a linked control/handle pair seeded with `initial`.
 pub fn hotkey_channel(initial: HotkeySpec) -> (HotkeyControl, HotkeyHandle) {
     let capturing = Arc::new(AtomicU8::new(CAPTURE_NONE));
+    let spec = Arc::new(Mutex::new(initial));
     let (tx, rx) = crossbeam_channel::unbounded();
     (
         HotkeyControl {
-            spec: Arc::new(Mutex::new(initial)),
+            spec: spec.clone(),
             capturing: capturing.clone(),
             updates: tx,
         },
         HotkeyHandle {
+            spec,
             capturing,
             updates: rx,
         },
