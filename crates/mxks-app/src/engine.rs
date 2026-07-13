@@ -486,10 +486,13 @@ impl Engine {
         }
 
         // First conversion: prefer the in-progress word, else the last completed.
-        let (keys, from, trailing) = if let Some(word) = self.buffer.current() {
-            (word.keys, word.lang, String::new())
+        // `in_progress` means no separator is on screen yet, so we add a trailing
+        // space ourselves (the word already has its space in the last-completed
+        // case, and convert() re-emits it).
+        let (keys, from, trailing, in_progress) = if let Some(word) = self.buffer.current() {
+            (word.keys, word.lang, String::new(), true)
         } else if let Some((word, trailing)) = self.last.take() {
-            (word.keys, word.lang, trailing)
+            (word.keys, word.lang, trailing, false)
         } else {
             return;
         };
@@ -497,12 +500,22 @@ impl Engine {
         let to = from.other();
         match self.corrector.convert(&keys, from, to, &trailing) {
             Ok(()) => {
+                // Convert AND separate the in-progress word with a space, so the
+                // user doesn't have to press Space right after the hotkey.
+                let toggle_trailing = if in_progress {
+                    if let Err(e) = self.corrector.append_space() {
+                        tracing::warn!("append space failed: {e:#}");
+                    }
+                    " ".to_string()
+                } else {
+                    trailing
+                };
                 self.active = to;
                 self.buffer.clear();
                 self.buffer.set_lang(self.active);
                 self.toggle = Some(Toggle {
                     keys,
-                    trailing,
+                    trailing: toggle_trailing,
                     lang: to,
                 });
             }
@@ -1154,14 +1167,17 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                // First press: EN -> RU.
+                // First press: EN -> RU, then a trailing space is appended.
                 Op::Backspaces(6),
                 Op::Switch(Lang::Ru),
                 Op::Type("привет".to_string()),
-                // Second press: toggle back RU -> EN.
-                Op::Backspaces(6),
+                Op::Type(" ".to_string()),
+                // Second press: toggle back RU -> EN, keeping the space (now on
+                // screen, so it is erased and re-typed by convert()).
+                Op::Backspaces(7),
                 Op::Switch(Lang::En),
                 Op::Type("ghbdtn".to_string()),
+                Op::Type(" ".to_string()),
             ]
         );
     }

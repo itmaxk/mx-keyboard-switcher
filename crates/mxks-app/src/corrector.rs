@@ -58,6 +58,12 @@ impl Corrector {
         self.injector.type_text(remainder)
     }
 
+    /// Type a single trailing space (layout-independent) after a manual
+    /// conversion, so the hotkey separates the word without a second keypress.
+    pub fn append_space(&mut self) -> Result<()> {
+        self.injector.type_text(" ")
+    }
+
     /// Replay a real Tab keypress (stale-accept fallback: the key was swallowed
     /// but there is no suggestion to complete, so give the app its Tab back).
     pub fn tab(&mut self) -> Result<()> {
