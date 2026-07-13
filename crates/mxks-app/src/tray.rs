@@ -67,6 +67,15 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
                     ..Default::default()
                 }
                 .into(),
+                CheckmarkItem {
+                    label: "Auto in terminals".into(),
+                    checked: self.status.terminal_auto,
+                    activate: Box::new(|t: &mut AppTray| {
+                        let _ = t.cmd_tx.send(Command::ToggleTerminalAuto);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
                 MenuItem::Separator,
                 StandardItem {
                     label: if self.status.capturing {
@@ -132,6 +141,7 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
             hotkey: "Pause".into(),
             capturing: false,
             autocomplete: true,
+            terminal_auto: false,
             accept_key: "Tab".into(),
         },
     };

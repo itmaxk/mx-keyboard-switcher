@@ -31,6 +31,8 @@ pub enum Command {
     SetHotkey,
     /// Toggle word autocomplete.
     ToggleAutocomplete,
+    /// Toggle full auto (correction + suggestions) inside terminals.
+    ToggleTerminalAuto,
     /// Arm "press a key" capture to reassign the autocomplete accept key.
     SetAcceptKey,
     /// Quit the application.
@@ -62,6 +64,8 @@ pub struct Status {
     pub capturing: bool,
     /// Autocomplete on/off (false also when the platform has no overlay).
     pub autocomplete: bool,
+    /// Whether terminals get full auto (vs manual-only).
+    pub terminal_auto: bool,
     /// Current accept key, human-readable (e.g. "Tab").
     pub accept_key: String,
 }
@@ -157,6 +161,7 @@ impl Engine {
             hotkey: self.config.hotkeys.convert_last_word.clone(),
             capturing: self.capturing,
             autocomplete: self.config.autocomplete.enabled && self.overlay_available,
+            terminal_auto: self.config.terminals.auto,
             accept_key: self.config.autocomplete.accept_key.clone(),
         }
     }
@@ -554,6 +559,18 @@ impl Engine {
                     tracing::warn!("could not save autocomplete switch: {e:#}");
                 }
                 tracing::info!("autocomplete = {on}");
+                self.broadcast_status();
+            }
+            Command::ToggleTerminalAuto => {
+                let on = !self.config.terminals.auto;
+                self.config.terminals.auto = on;
+                // A hint may be showing in a terminal that is now manual-only.
+                self.dismiss_suggestion();
+                self.active_accept = None;
+                if let Err(e) = crate::config_io::save_terminal_auto(on) {
+                    tracing::warn!("could not save terminal-auto switch: {e:#}");
+                }
+                tracing::info!("terminal auto = {on}");
                 self.broadcast_status();
             }
             Command::SetAcceptKey => {

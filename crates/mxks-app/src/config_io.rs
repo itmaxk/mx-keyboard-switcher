@@ -37,6 +37,11 @@ pub fn save_autocomplete_enabled(on: bool) -> Result<()> {
     save_key_line("autocomplete", "enabled", if on { "true" } else { "false" })
 }
 
+/// Persist the "full auto inside terminals" switch into the config file.
+pub fn save_terminal_auto(on: bool) -> Result<()> {
+    save_key_line("terminals", "auto", if on { "true" } else { "false" })
+}
+
 /// Replace `key = <value>` inside `[section]` of the config file, preserving
 /// comments and everything else line-by-line. Appends the section+key when the
 /// file does not contain them yet.
