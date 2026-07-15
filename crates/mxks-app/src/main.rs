@@ -4,6 +4,7 @@
 //! channel; the tray sends commands over another; the engine owns the buffer,
 //! detector, and corrector.
 
+mod autostart;
 mod config_io;
 mod corrector;
 mod engine;

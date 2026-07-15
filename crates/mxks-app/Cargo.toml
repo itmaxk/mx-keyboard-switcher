@@ -27,6 +27,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# HKCU Run-key access for the "Start at login" toggle.
+winreg = "0.56"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust StatusNotifierItem tray (zbus, no GTK/libdbus). Lightweight
 # async-io runtime instead of tokio.

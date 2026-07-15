@@ -21,7 +21,7 @@ single binary per OS.
   the word back. Reassign it from the tray (**Change hotkey → press a key**) or
   in the config — matching is by key name, so any key or chord works.
 - **System tray**: enable/disable, toggle autocorrection, change the hotkey,
-  open/reload config.
+  open/reload config, toggle start at login.
 - **TOML config** with per-app and per-word exclusions and a custom dictionary.
 - **Privacy**: no network access at all; nothing leaves your machine.
 

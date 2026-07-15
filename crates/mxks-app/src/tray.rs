@@ -120,6 +120,15 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
                     ..Default::default()
                 }
                 .into(),
+                CheckmarkItem {
+                    label: "Start at login".into(),
+                    checked: self.status.autostart,
+                    activate: Box::new(|t: &mut AppTray| {
+                        let _ = t.cmd_tx.send(Command::ToggleAutostart);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
                 MenuItem::Separator,
                 StandardItem {
                     label: "Quit".into(),
@@ -143,6 +152,7 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>) {
             autocomplete: true,
             terminal_auto: false,
             accept_key: "Tab".into(),
+            autostart: crate::autostart::is_enabled(),
         },
     };
     let handle = match tray.spawn() {

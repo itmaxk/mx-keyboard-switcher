@@ -35,6 +35,8 @@ pub enum Command {
     ToggleTerminalAuto,
     /// Arm "press a key" capture to reassign the autocomplete accept key.
     SetAcceptKey,
+    /// Toggle the OS "start at login" entry.
+    ToggleAutostart,
     /// Quit the application.
     Quit,
 }
@@ -68,6 +70,9 @@ pub struct Status {
     pub terminal_auto: bool,
     /// Current accept key, human-readable (e.g. "Tab").
     pub accept_key: String,
+    /// Whether an OS "start at login" entry exists (source of truth is the OS,
+    /// not the config file).
+    pub autostart: bool,
 }
 
 /// The result of the most recent *manual* conversion, kept so the hotkey can
@@ -163,6 +168,7 @@ impl Engine {
             autocomplete: self.config.autocomplete.enabled && self.overlay_available,
             terminal_auto: self.config.terminals.auto,
             accept_key: self.config.autocomplete.accept_key.clone(),
+            autostart: crate::autostart::is_enabled(),
         }
     }
 
@@ -590,6 +596,14 @@ impl Engine {
                 self.capturing = true;
                 self.hotkey.begin_capture(CaptureTarget::AcceptKey);
                 tracing::info!("press a key (optionally with modifiers) to set the accept key");
+                self.broadcast_status();
+            }
+            Command::ToggleAutostart => {
+                let on = !crate::autostart::is_enabled();
+                if let Err(e) = crate::autostart::set_enabled(on) {
+                    tracing::warn!("could not update autostart: {e:#}");
+                }
+                tracing::info!("autostart = {on}");
                 self.broadcast_status();
             }
             Command::Quit => return true,
