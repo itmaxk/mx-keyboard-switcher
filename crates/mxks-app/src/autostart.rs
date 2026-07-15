@@ -59,8 +59,7 @@ mod imp {
 
     fn enable_at(path: &Path, exe: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         }
         std::fs::write(path, desktop_entry(exe))
             .with_context(|| format!("write {}", path.display()))
@@ -86,10 +85,8 @@ mod imp {
 
         #[test]
         fn desktop_entry_roundtrip() {
-            let dir = std::env::temp_dir().join(format!(
-                "mxks-autostart-test-{}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("mxks-autostart-test-{}", std::process::id()));
             let path = dir.join("autostart").join("mx-keyboard-switcher.desktop");
             let exe = Path::new("/some dir/mx-keyboard-switcher");
 
@@ -126,7 +123,9 @@ mod imp {
     }
 
     fn xml_escape(s: &str) -> String {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     fn plist(exe: &Path) -> String {
