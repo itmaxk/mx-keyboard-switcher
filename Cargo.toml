@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Max K"]
-repository = "https://github.com/maxk/mx-keyboard-switcher"
+repository = "https://github.com/itmaxk/mx-keyboard-switcher"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

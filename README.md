@@ -66,6 +66,28 @@ that it is not exfiltrating anything.
 
 ## Install / Build
 
+### Quick install (one command)
+
+Linux / macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itmaxk/mx-keyboard-switcher/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/itmaxk/mx-keyboard-switcher/main/scripts/install.ps1 | iex"
+```
+
+Flags:
+
+- Linux/macOS: `sh -s -- --no-autostart` · `--from-source` · `--version vX.Y.Z`
+- Windows (piped with flags): `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/itmaxk/mx-keyboard-switcher/main/scripts/install.ps1))) -NoAutostart`
+
+If there is no release asset for your platform yet, the script builds from source (needs `cargo`).
+
+
 Requires a recent Rust toolchain (`rustup`, stable).
 
 ```sh

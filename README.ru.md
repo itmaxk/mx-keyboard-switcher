@@ -69,6 +69,28 @@ Mac нет клавиши Pause/Break — задайте другую клави
 
 ## Установка / Сборка
 
+### Быстрая установка (одной командой)
+
+Linux / macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/itmaxk/mx-keyboard-switcher/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/itmaxk/mx-keyboard-switcher/main/scripts/install.ps1 | iex"
+```
+
+Флаги:
+
+- Linux/macOS: `sh -s -- --no-autostart` · `--from-source` · `--version vX.Y.Z`
+- Windows (с флагами через пайп): `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/itmaxk/mx-keyboard-switcher/main/scripts/install.ps1))) -NoAutostart`
+
+Если для вашей платформы ещё нет релиза, скрипт соберёт бинарь из исходников (нужен `cargo`).
+
+
 Нужен свежий тулчейн Rust (`rustup`, stable).
 
 ```sh
