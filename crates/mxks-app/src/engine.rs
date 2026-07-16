@@ -864,12 +864,37 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                Op::Backspaces(7),
                 Op::Switch(Lang::Ru),
+                Op::Backspaces(7),
                 Op::Type("привет".to_string()),
                 Op::Type(" ".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn layout_change_during_word_skips_autocorrect() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _overlay_rx, _icontrol, current) =
+            autocomplete_engine_with_layout(log.clone(), Lang::En);
+        let (key_tx, key_rx) = crossbeam_channel::unbounded();
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        key_tx.send(letter_shift(PhysKey::H)).unwrap();
+        *current.lock().unwrap() = Lang::Ru;
+        for key in [
+            PhysKey::T,
+            PhysKey::Comma,
+            PhysKey::Backtick,
+            PhysKey::Y,
+            PhysKey::J,
+            PhysKey::R,
+        ] {
+            key_tx.send(letter(key)).unwrap();
+        }
+        key_tx.send(space()).unwrap();
+        drop(key_tx);
+        engine.run(key_rx, cmd_rx);
+        assert!(log.lock().unwrap().is_empty());
     }
 
     /// Build an engine whose focus reports `app`, with a custom config, for the
@@ -898,8 +923,8 @@ mod tests {
     /// The exact op sequence a manual `ghbdtn ` -> `привет` conversion produces.
     fn expected_ghbdtn_convert() -> Vec<Op> {
         vec![
-            Op::Backspaces(7),
             Op::Switch(Lang::Ru),
+            Op::Backspaces(7),
             Op::Type("привет".to_string()),
             Op::Type(" ".to_string()),
         ]
@@ -1181,15 +1206,13 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                // First press: EN -> RU, then a trailing space is appended.
-                Op::Backspaces(6),
                 Op::Switch(Lang::Ru),
+                Op::Backspaces(6),
                 Op::Type("привет".to_string()),
                 Op::Type(" ".to_string()),
                 // Second press: toggle back RU -> EN, keeping the space (now on
-                // screen, so it is erased and re-typed by convert()).
-                Op::Backspaces(7),
                 Op::Switch(Lang::En),
+                Op::Backspaces(7),
                 Op::Type("ghbdtn".to_string()),
                 Op::Type(" ".to_string()),
             ]

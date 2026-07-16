@@ -30,7 +30,12 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 [target.'cfg(target_os = "windows")'.dependencies]
 # HKCU Run-key access for the "Start at login" toggle.
 winreg = "0.56"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = { version = "0.24.1", default-features = false, optional = true }

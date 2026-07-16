@@ -21,8 +21,38 @@ use anyhow::{Context, Result};
 use mxks_core::hotkey;
 use mxks_platform::{KeyEvent, OverlayCmd};
 
+#[cfg(target_os = "windows")]
+use windows::{
+    core::HSTRING,
+    Win32::{
+        Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE},
+        System::Threading::CreateMutexW,
+    },
+};
+
 use crate::corrector::Corrector;
 use crate::engine::{Command, Engine, Status};
+
+#[cfg(target_os = "windows")]
+struct InstanceGuard(HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn acquire_named_instance(name: &HSTRING) -> Result<Option<InstanceGuard>> {
+    let handle = unsafe { CreateMutexW(None, false, name) }?;
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(handle) }?;
+        return Ok(None);
+    }
+
+    Ok(Some(InstanceGuard(handle)))
+}
 
 fn main() {
     init_logging();
@@ -34,6 +64,12 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    let _instance_guard = match acquire_named_instance(&HSTRING::from("Local\\MXKeyboardSwitcher"))?
+    {
+        Some(guard) => guard,
+        None => return Ok(()),
+    };
     let config = config_io::load();
 
     let spec = hotkey::parse(&config.hotkeys.convert_last_word).unwrap_or_default();
@@ -128,6 +164,38 @@ fn report_fatal(error: &anyhow::Error) {
 #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
 fn report_fatal(error: &anyhow::Error) {
     eprintln!("mx-keyboard-switcher: {error:#}");
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn second_windows_instance_is_rejected() {
+        let name = HSTRING::from(format!(
+            "Local\\MXKeyboardSwitcher-test-{}",
+            std::process::id()
+        ));
+
+        let first = acquire_named_instance(&name)
+            .expect("first mutex acquisition should succeed")
+            .expect("first mutex acquisition should own the mutex");
+        assert!(
+            acquire_named_instance(&name)
+                .expect("second mutex acquisition should succeed")
+                .is_none(),
+            "second mutex acquisition must be rejected"
+        );
+
+        drop(first);
+
+        assert!(
+            acquire_named_instance(&name)
+                .expect("mutex reacquisition after drop should succeed")
+                .is_some(),
+            "mutex should be acquirable after the first guard is dropped"
+        );
+    }
 }
 
 /// Placeholder so we can move the real capture out of `Backend` into its thread.

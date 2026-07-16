@@ -1,19 +1,23 @@
 //! Reading and switching the active keyboard layout via Win32.
 
-use anyhow::Result;
+use std::time::{Duration, Instant};
+
+use anyhow::{bail, Result};
 use mxks_core::layout::Lang;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyboardLayout, LoadKeyboardLayoutW, ACTIVATE_KEYBOARD_LAYOUT_FLAGS,
+    GetKeyboardLayout, LoadKeyboardLayoutW, ACTIVATE_KEYBOARD_LAYOUT_FLAGS, KLF_ACTIVATE,
+    KLF_SUBSTITUTE_OK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
+    GetForegroundWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_INPUTLANGCHANGEREQUEST,
 };
 
 const LANGID_EN: u16 = 0x0409;
 const LANGID_RU: u16 = 0x0419;
-const KLF_ACTIVATE: u32 = 0x0000_0001;
+const SWITCH_TIMEOUT: Duration = Duration::from_millis(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 pub struct WinLayout;
 
@@ -23,40 +27,71 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 impl crate::LayoutSwitcher for WinLayout {
     fn current(&self) -> Result<Option<Lang>> {
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            let tid = GetWindowThreadProcessId(hwnd, None);
-            let hkl = GetKeyboardLayout(tid);
-            let langid = (hkl.0 as usize & 0xFFFF) as u16;
-            Ok(match langid {
-                LANGID_EN => Some(Lang::En),
-                LANGID_RU => Some(Lang::Ru),
-                _ => None,
-            })
-        }
+        let keyboard = super::foreground_keyboard()?;
+        Ok(match langid(keyboard.hkl) {
+            LANGID_EN => Some(Lang::En),
+            LANGID_RU => Some(Lang::Ru),
+            _ => None,
+        })
     }
 
     fn switch_to(&mut self, lang: Lang) -> Result<()> {
+        let target_langid = match lang {
+            Lang::En => LANGID_EN,
+            Lang::Ru => LANGID_RU,
+        };
+        let keyboard = super::foreground_keyboard()?;
+        if langid(keyboard.hkl) == target_langid {
+            return Ok(());
+        }
+
         let klid = match lang {
             Lang::En => "00000409",
             Lang::Ru => "00000419",
         };
         let wide = to_wide(klid);
-        unsafe {
-            let hkl = LoadKeyboardLayoutW(
+        let hkl = unsafe {
+            LoadKeyboardLayoutW(
                 PCWSTR(wide.as_ptr()),
-                ACTIVATE_KEYBOARD_LAYOUT_FLAGS(KLF_ACTIVATE),
-            )?;
-            let hwnd = GetForegroundWindow();
-            // Ask the focused window to switch layout (more reliable than
-            // ActivateKeyboardLayout, which affects only the calling thread).
-            PostMessageW(
-                Some(hwnd),
+                ACTIVATE_KEYBOARD_LAYOUT_FLAGS(KLF_ACTIVATE.0 | KLF_SUBSTITUTE_OK.0),
+            )?
+        };
+        if langid(hkl) != target_langid {
+            bail!("loaded keyboard layout has unexpected language");
+        }
+
+        let message_result = unsafe {
+            SendMessageTimeoutW(
+                keyboard.hwnd,
                 WM_INPUTLANGCHANGEREQUEST,
                 WPARAM(0),
                 LPARAM(hkl.0 as isize),
-            )?;
+                SMTO_ABORTIFHUNG,
+                25,
+                None,
+            )
+        };
+        if message_result.0 == 0 {
+            bail!("foreground window rejected or timed out changing keyboard layout");
         }
-        Ok(())
+
+        let deadline = Instant::now() + SWITCH_TIMEOUT;
+        loop {
+            if unsafe { GetForegroundWindow() } != keyboard.hwnd {
+                bail!("foreground window changed while activating keyboard layout");
+            }
+            let current = unsafe { GetKeyboardLayout(keyboard.thread_id) };
+            if langid(current) == target_langid {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("target keyboard layout did not activate before deadline");
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
+}
+
+fn langid(hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL) -> u16 {
+    (hkl.0 as usize & 0xFFFF) as u16
 }

@@ -30,6 +30,16 @@ pub trait KeyInjector: Send {
     fn backspaces(&mut self, n: usize) -> Result<()>;
     /// Type `text` as Unicode input (layout-independent where the OS allows).
     fn type_text(&mut self, text: &str) -> Result<()>;
+    /// Atomically replace erased text with rendered text and trailing separator.
+    /// Platforms without a batch primitive use the default sequential path.
+    fn replace_text(&mut self, erase: usize, text: &str, trailing: &str) -> Result<()> {
+        self.backspaces(erase)?;
+        self.type_text(text)?;
+        if !trailing.is_empty() {
+            self.type_text(trailing)?;
+        }
+        Ok(())
+    }
     /// Send one real Tab keypress (replays a swallowed accept key that turned
     /// out to be stale).
     fn tab(&mut self) -> Result<()> {

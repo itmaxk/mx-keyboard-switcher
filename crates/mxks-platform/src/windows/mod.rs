@@ -10,11 +10,45 @@ mod overlay;
 
 use anyhow::Result;
 use mxks_core::hotkey::HotkeySpec;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, HKL};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use crate::{Backend, FocusInfo};
 
 /// Tag written to `dwExtraInfo` on every injected event.
 pub const MAGIC: usize = 0x4B42_5357; // "KBSW"
+
+pub(super) struct ForegroundKeyboard {
+    pub hwnd: HWND,
+    pub thread_id: u32,
+    pub hkl: HKL,
+}
+
+pub(super) fn foreground_keyboard() -> Result<ForegroundKeyboard> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            anyhow::bail!("no foreground window");
+        }
+
+        let thread_id = GetWindowThreadProcessId(hwnd, None);
+        if thread_id == 0 {
+            anyhow::bail!("foreground window has no thread");
+        }
+
+        let hkl = GetKeyboardLayout(thread_id);
+        if hkl.0.is_null() {
+            anyhow::bail!("foreground thread has no keyboard layout");
+        }
+
+        Ok(ForegroundKeyboard {
+            hwnd,
+            thread_id,
+            hkl,
+        })
+    }
+}
 
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
     let (control, handle) = crate::hotkey_channel(hotkey);

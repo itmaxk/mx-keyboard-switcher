@@ -25,16 +25,21 @@ impl Corrector {
     /// count), so it is correct even when the two layouts render different
     /// character counts.
     pub fn convert(&mut self, keys: &[Stroke], from: Lang, to: Lang, trailing: &str) -> Result<()> {
-        let current = render_keys(keys, from);
-        let erase = current.chars().count() + trailing.chars().count();
-        self.injector.backspaces(erase)?;
-        self.layout.switch_to(to)?;
-        let text = render_keys(keys, to);
-        self.injector.type_text(&text)?;
-        if !trailing.is_empty() {
-            self.injector.type_text(trailing)?;
+        let current = self.layout.current()?;
+        if current != Some(from) {
+            anyhow::bail!(
+                "source layout changed before correction: expected {from:?}, got {current:?}"
+            );
         }
-        Ok(())
+        self.layout.switch_to(to)?;
+        let current = self.layout.current()?;
+        if current != Some(to) {
+            anyhow::bail!("target layout did not activate: expected {to:?}, got {current:?}");
+        }
+        let rendered = render_keys(keys, from);
+        let erase = rendered.chars().count() + trailing.chars().count();
+        let text = render_keys(keys, to);
+        self.injector.replace_text(erase, &text, trailing)
     }
 
     /// Read the current system layout, if it is EN or RU.
