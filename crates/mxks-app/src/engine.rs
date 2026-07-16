@@ -17,7 +17,7 @@ use crate::corrector::Corrector;
 // Some variants are only constructed by the tray, which is compiled out on
 // platforms/builds without it.
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     /// Toggle the master enable switch.
     ToggleEnabled,

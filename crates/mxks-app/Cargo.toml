@@ -10,11 +10,10 @@ name = "mx-keyboard-switcher"
 path = "src/main.rs"
 
 [features]
-# Tray icon. On by default. On Linux this needs `libdbus-1-dev` at build time;
-# disable with `--no-default-features` to build a headless binary. On non-Linux
-# the tray is not yet implemented and the app runs headless regardless.
+# Native tray icon. On by default; disable with `--no-default-features` to
+# build a headless binary.
 default = ["tray"]
-tray = ["dep:ksni"]
+tray = ["dep:image", "dep:ksni", "dep:tray-icon", "dep:winit"]
 
 [dependencies]
 mxks-core = { path = "../mxks-core" }
@@ -26,12 +25,21 @@ dirs = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # HKCU Run-key access for the "Start at login" toggle.
 winreg = "0.56"
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.24.1", default-features = false, optional = true }
+winit = { version = "0.30.13", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure-Rust StatusNotifierItem tray (zbus, no GTK/libdbus). Lightweight
 # async-io runtime instead of tokio.
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"], optional = true }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

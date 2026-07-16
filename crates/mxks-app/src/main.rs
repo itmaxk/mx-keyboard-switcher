@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 //! MX Keyboard Switcher — a fast, lightweight cross-platform Punto Switcher analog.
 //!
 //! Wiring: a platform capture thread feeds key events into the engine over a
@@ -21,9 +26,9 @@ use crate::engine::{Command, Engine, Status};
 
 fn main() {
     init_logging();
-    if let Err(e) = run() {
-        tracing::error!("fatal: {e:#}");
-        eprintln!("mx-keyboard-switcher: {e:#}");
+    if let Err(error) = run() {
+        tracing::error!("fatal: {error:#}");
+        report_fatal(&error);
         std::process::exit(1);
     }
 }
@@ -70,16 +75,59 @@ fn run() -> Result<()> {
         ),
     }
 
-    tray::start(cmd_tx, status_rx);
-
     let corrector = Corrector::new(backend.injector, backend.layout);
     let mut app = Engine::new(config, corrector, backend.focus, backend.hotkey)
         .with_status_channel(status_tx)
         .with_autocomplete(overlay_tx, backend.intercept, overlay_available);
+    let initial_status = app.status();
 
     tracing::info!("MX Keyboard Switcher running");
-    app.run(key_rx, cmd_rx);
-    Ok(())
+
+    #[cfg(all(any(target_os = "windows", target_os = "macos"), feature = "tray"))]
+    {
+        let (engine_done_tx, engine_done_rx) = crossbeam_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("mxks-engine".to_owned())
+            .spawn(move || {
+                app.run(key_rx, cmd_rx);
+                let _ = engine_done_tx.send(());
+            })
+            .context("spawning engine thread")?;
+
+        tray::run(cmd_tx, status_rx, initial_status, engine_done_rx)
+    }
+
+    #[cfg(not(all(any(target_os = "windows", target_os = "macos"), feature = "tray")))]
+    {
+        tray::start(cmd_tx, status_rx, initial_status);
+        app.run(key_rx, cmd_rx);
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn report_fatal(error: &anyhow::Error) {
+    use windows::{
+        core::{w, HSTRING},
+        Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK},
+    };
+
+    let body = HSTRING::from(format!(
+        "MX Keyboard Switcher could not start:\n\n{error:#}"
+    ));
+    unsafe {
+        MessageBoxW(
+            None,
+            &body,
+            w!("MX Keyboard Switcher"),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(all(target_os = "windows", not(debug_assertions))))]
+fn report_fatal(error: &anyhow::Error) {
+    eprintln!("mx-keyboard-switcher: {error:#}");
 }
 
 /// Placeholder so we can move the real capture out of `Backend` into its thread.
