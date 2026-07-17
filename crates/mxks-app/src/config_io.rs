@@ -4,10 +4,15 @@ use anyhow::{Context, Result};
 use mxks_core::config::{Config, DEFAULT_TEMPLATE};
 use std::path::PathBuf;
 
+/// Application config directory: `<config_dir>/mx-keyboard-switcher`.
+pub fn app_config_dir() -> Result<PathBuf> {
+    let dir = dirs::config_dir().context("no config directory for this platform")?;
+    Ok(dir.join("mx-keyboard-switcher"))
+}
+
 /// Path to the config file: `<config_dir>/mx-keyboard-switcher/config.toml`.
 pub fn config_path() -> Result<PathBuf> {
-    let dir = dirs::config_dir().context("no config directory for this platform")?;
-    Ok(dir.join("mx-keyboard-switcher").join("config.toml"))
+    Ok(app_config_dir()?.join("config.toml"))
 }
 
 /// Load the config, creating a commented default file on first run. A malformed

@@ -14,6 +14,7 @@ mod config_io;
 mod corrector;
 mod engine;
 mod tray;
+mod usage_io;
 
 use std::path::Path;
 
@@ -113,6 +114,7 @@ fn run() -> Result<()> {
 
     let corrector = Corrector::new(backend.injector, backend.layout);
     let mut app = Engine::new(config, corrector, backend.focus, backend.hotkey)
+        .with_usage_store(usage_io::UsageStore::load())
         .with_status_channel(status_tx)
         .with_autocomplete(overlay_tx, backend.intercept, overlay_available);
     let initial_status = app.status();

@@ -25,17 +25,18 @@ pipeline. These manual steps verify end-to-end behaviour in real apps on each OS
 | 8 | Tray → toggle **Enabled** off, repeat #1 and #5 | Nothing happens |
 | 9 | Type fast: `ghbdtn ghbdtn ghbdtn ` | Each corrected; no doubled/dropped characters |
 | 10 | Edit config `threshold`, Tray → **Reload config** | New value takes effect |
+| 11 | Import `готово=7`, type `г`, then continue to `готи` | `готово` is suggested after `г`; it disappears or changes at `готи` because the full prefix must match |
+| 12 | Type the shown `готово` completion manually, then press the accept key | Overlay shows `[Tab: confirm]`; confirmation does not change text and stores exactly one new accept |
 
 ## Tray and icon (run on every OS)
 
 Run these checks with the default `tray` feature enabled:
 
-1. Confirm the tray/menu-bar shows the unique MX exchange icon, not a generic
-   keyboard or missing-icon placeholder.
-2. Open the menu and confirm all ten actions are present:
+2. Open the menu and confirm all twelve actions are present:
    **Enabled**, **Autocorrection**, **Autocomplete**, **Auto in terminals**,
    **Change hotkey (now: …)**, **Change accept key (now: …)**,
-   **Open config file**, **Reload config**, **Start at login**, and **Quit**.
+   **Open config file**, **Reload config**, **Export autocomplete counters**,
+   **Import autocomplete counters**, **Start at login**, and **Quit**.
 3. Toggle **Enabled**, **Autocorrection**, **Autocomplete**,
    **Auto in terminals**, and **Start at login**. Each checkmark must follow the
    current engine state immediately and remain correct after reopening the menu.
@@ -46,7 +47,12 @@ Run these checks with the default `tray` feature enabled:
    configured values.
 5. Use **Open config file**, change a value, then use **Reload config** and
    confirm the corresponding checkmark or dynamic label is refreshed.
-6. Choose **Quit**. The icon must disappear and the process must exit cleanly
+6. Choose **Export autocomplete counters** and confirm
+   `autocomplete-usage-transfer.toml` appears beside `config.toml`.
+7. Copy that file to a second isolated configuration, choose **Import
+   autocomplete counters**, and confirm the learned suggestion returns; repeat
+   import and verify the count does not increase.
+8. Choose **Quit**. The icon must disappear and the process must exit cleanly
    after the keyboard engine stops.
 
 ## Linux (X11)

@@ -13,6 +13,7 @@ pub mod dict;
 pub mod hotkey;
 pub mod keycode;
 pub mod layout;
+pub mod usage;
 
 /// Tables generated at build time from `data/` (word lists + bigram models).
 pub mod tables {

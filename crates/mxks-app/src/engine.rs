@@ -7,11 +7,13 @@ use mxks_core::config::Config;
 use mxks_core::convert::{render_keys, Stroke};
 use mxks_core::detect::{analyze, Params, Verdict};
 use mxks_core::layout::Lang;
+use mxks_core::usage::WordUsage;
 use mxks_platform::{
     CaptureTarget, FocusInfo, HotkeyHandle, InterceptHandle, KeyEvent, KeyKind, OverlayCmd,
 };
 
 use crate::corrector::Corrector;
+use crate::usage_io::UsageStore;
 
 /// Commands sent from the tray (or other UI) to the engine.
 // Some variants are only constructed by the tray, which is compiled out on
@@ -37,6 +39,10 @@ pub enum Command {
     SetAcceptKey,
     /// Toggle the OS "start at login" entry.
     ToggleAutostart,
+    /// Export autocomplete acceptance counters to the portable transfer file.
+    ExportAutocompleteCounters,
+    /// Import autocomplete acceptance counters from the portable transfer file.
+    ImportAutocompleteCounters,
     /// Quit the application.
     Quit,
 }
@@ -84,6 +90,13 @@ struct Toggle {
     lang: Lang,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Suggestion {
+    word: &'static str,
+    remainder: String,
+    lang: Lang,
+}
+
 pub struct Engine {
     buffer: WordBuffer,
     config: Config,
@@ -99,8 +112,10 @@ pub struct Engine {
     toggle: Option<Toggle>,
     /// Broadcasts status changes so the tray can update its menu.
     status_tx: Option<Sender<Status>>,
-    /// Remainder of the currently suggested completion, if one is visible.
-    suggestion: Option<String>,
+    /// Full dictionary candidate currently offered to the user.
+    suggestion: Option<Suggestion>,
+    /// Locally learned autocomplete acceptance counters.
+    usage: UsageStore,
     /// Channel to the overlay thread (non-blocking sends only).
     overlay_tx: Option<Sender<OverlayCmd>>,
     /// Toggles accept-key interception in the capture backend.
@@ -133,6 +148,7 @@ impl Engine {
             toggle: None,
             status_tx: None,
             suggestion: None,
+            usage: UsageStore::memory(WordUsage::default()),
             overlay_tx: None,
             intercept: None,
             active_accept: None,
@@ -142,6 +158,11 @@ impl Engine {
 
     pub fn with_status_channel(mut self, tx: Sender<Status>) -> Self {
         self.status_tx = Some(tx);
+        self
+    }
+
+    pub fn with_usage_store(mut self, usage: UsageStore) -> Self {
+        self.usage = usage;
         self
     }
 
@@ -249,11 +270,11 @@ impl Engine {
                     self.last = None;
                 }
                 self.buffer.feed(Event::Letter(Stroke { key, shift }));
-                self.refresh_suggestion();
+                self.refresh_suggestion(true);
             }
             KeyKind::Backspace => {
                 self.buffer.feed(Event::Backspace);
-                self.refresh_suggestion();
+                self.refresh_suggestion(false);
             }
             KeyKind::Boundary { sep } => {
                 self.dismiss_suggestion();
@@ -276,14 +297,15 @@ impl Engine {
 
     /// Recompute the completion for the in-progress word and sync the overlay
     /// and accept-key interception with it.
-    fn refresh_suggestion(&mut self) {
+    fn refresh_suggestion(&mut self, continue_offered: bool) {
         if self.overlay_tx.is_none() {
             return;
         }
         // Suggestions are automatic, so only where the app is fully enabled.
         let (mode, is_terminal) = self.classify_focus(&self.focus.focused_app());
         let want = if mode == AppMode::Full {
-            self.compute_suggestion()
+            self.continued_suggestion(continue_offered)
+                .or_else(|| self.compute_suggestion())
         } else {
             None
         };
@@ -292,7 +314,7 @@ impl Engine {
         }
         match &want {
             // Re-send even when unchanged so the hint follows the caret.
-            Some(text) => {
+            Some(suggestion) => {
                 // Pick the accept key for this app: terminals may use a separate
                 // one so the global Tab does not hijack shell completion.
                 let key = if is_terminal {
@@ -301,7 +323,12 @@ impl Engine {
                     self.config.autocomplete.accept_key.clone()
                 };
                 self.set_accept_key(&key);
-                self.send_overlay(OverlayCmd::Show { text: text.clone() });
+                let text = if suggestion.remainder.is_empty() {
+                    format!("[{key}: confirm]")
+                } else {
+                    suggestion.remainder.clone()
+                };
+                self.send_overlay(OverlayCmd::Show { text });
                 self.set_intercept(true);
             }
             None => {
@@ -312,29 +339,66 @@ impl Engine {
         self.suggestion = want;
     }
 
-    /// The remainder to suggest for the current word, if any.
-    fn compute_suggestion(&self) -> Option<String> {
+    /// Keep an already offered candidate stable while the user types it out.
+    fn continued_suggestion(&self, continue_offered: bool) -> Option<Suggestion> {
+        if !continue_offered
+            || !self.config.autocomplete.enabled
+            || !self.enabled
+            || !self.overlay_available
+        {
+            return None;
+        }
+        let offered = self.suggestion.as_ref()?;
+        let word = self.buffer.current()?;
+        if word.lang != offered.lang {
+            return None;
+        }
+        let prefix = render_keys(&word.keys, word.lang).to_lowercase();
+        if !offered.word.starts_with(&prefix) {
+            return None;
+        }
+        Some(Suggestion {
+            word: offered.word,
+            remainder: self.adjust_remainder_case(offered.word, &prefix, &word),
+            lang: offered.lang,
+        })
+    }
+
+    /// A new strict-extension candidate for the current word, if any.
+    fn compute_suggestion(&self) -> Option<Suggestion> {
         let ac = &self.config.autocomplete;
         if !ac.enabled || !self.enabled || !self.overlay_available {
             return None;
         }
         let word = self.buffer.current()?;
         let prefix = render_keys(&word.keys, word.lang).to_lowercase();
-        let prefix_len = prefix.chars().count();
-        if prefix_len < ac.min_prefix {
+        if prefix.is_empty() {
             return None;
         }
-        let full = mxks_core::dict::complete(&prefix, word.lang)?;
-        let remainder: String = full.chars().skip(prefix_len).collect();
+        let prefix_len = prefix.chars().count();
+        let minimum_count = u32::from(prefix_len < ac.min_prefix);
+        let full =
+            mxks_core::dict::complete(&prefix, word.lang, self.usage.usage(), minimum_count)?;
+        let remainder = self.adjust_remainder_case(full, &prefix, &word);
         if remainder.chars().count() < ac.min_remainder {
             return None;
         }
+        Some(Suggestion {
+            word: full,
+            remainder,
+            lang: word.lang,
+        })
+    }
+
+    fn adjust_remainder_case(&self, full: &str, prefix: &str, word: &Word) -> String {
+        let remainder: String = full.chars().skip(prefix.chars().count()).collect();
         // All-caps input gets an all-caps completion; otherwise keep lowercase
         // (a leading capital still yields "Hel" + "lo").
         if word.keys.len() >= 2 && word.keys.iter().all(|s| s.shift) {
-            return Some(remainder.to_uppercase());
+            remainder.to_uppercase()
+        } else {
+            remainder
         }
-        Some(remainder)
     }
 
     /// Hide the hint and stop intercepting the accept key.
@@ -347,7 +411,7 @@ impl Engine {
 
     /// The accept key fired (and was swallowed by the backend where possible).
     fn on_accept(&mut self) {
-        let Some(remainder) = self.suggestion.take() else {
+        let Some(suggestion) = self.suggestion.take() else {
             // Stale accept: the suggestion was dismissed while the keypress was
             // in flight. Replay a real Tab so the user's keystroke isn't lost
             // (other accept keys are inert on their own — just drop those).
@@ -372,22 +436,29 @@ impl Engine {
         self.send_overlay(OverlayCmd::Hide);
         self.set_intercept(false);
 
-        let lang = self.buffer.current().map(|w| w.lang).unwrap_or(self.active);
-        if let Err(e) = self.corrector.insert_completion(&remainder, lang) {
-            tracing::warn!("completion injection failed: {e:#}");
-            return;
-        }
-        // Mirror the injected letters into the buffer so it matches the screen;
-        // the completed word is a dictionary word of `lang` by construction, so
-        // a later Space boundary will never "correct" it.
-        for c in remainder.chars() {
-            let lower = mxks_core::layout::to_lower(c);
-            if let Some(key) = mxks_core::layout::char_to_key(lower, lang) {
-                self.buffer.feed(Event::Letter(Stroke {
-                    key,
-                    shift: c != lower,
-                }));
+        if !suggestion.remainder.is_empty() {
+            if let Err(e) = self
+                .corrector
+                .insert_completion(&suggestion.remainder, suggestion.lang)
+            {
+                tracing::warn!("completion injection failed: {e:#}");
+                return;
             }
+            // Mirror the injected letters into the buffer so it matches the
+            // screen and a later boundary sees the completed dictionary word.
+            for c in suggestion.remainder.chars() {
+                let lower = mxks_core::layout::to_lower(c);
+                if let Some(key) = mxks_core::layout::char_to_key(lower, suggestion.lang) {
+                    self.buffer.feed(Event::Letter(Stroke {
+                        key,
+                        shift: c != lower,
+                    }));
+                }
+            }
+        }
+
+        if let Err(e) = self.usage.record_accept(suggestion.word, suggestion.lang) {
+            tracing::warn!("could not persist autocomplete acceptance: {e:#}");
         }
     }
 
@@ -533,6 +604,9 @@ impl Engine {
         match cmd {
             Command::ToggleEnabled => {
                 self.enabled = !self.enabled;
+                if !self.enabled {
+                    self.dismiss_suggestion();
+                }
                 tracing::info!("enabled = {}", self.enabled);
                 self.broadcast_status();
             }
@@ -606,6 +680,32 @@ impl Engine {
                 tracing::info!("autostart = {on}");
                 self.broadcast_status();
             }
+            Command::ExportAutocompleteCounters => match self.usage.export() {
+                Ok(path) => {
+                    tracing::info!("autocomplete counters exported to {}", path.display());
+                    if let Ok(dir) = crate::config_io::app_config_dir() {
+                        crate::open_path(&dir);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("could not export autocomplete counters: {e:#}");
+                    if let Ok(dir) = crate::config_io::app_config_dir() {
+                        crate::open_path(&dir);
+                    }
+                }
+            },
+            Command::ImportAutocompleteCounters => match self.usage.import_max() {
+                Ok(changed) => {
+                    self.dismiss_suggestion();
+                    tracing::info!("imported autocomplete counters; {changed} entries changed");
+                }
+                Err(e) => {
+                    tracing::warn!("could not import autocomplete counters: {e:#}");
+                    if let Ok(dir) = crate::config_io::app_config_dir() {
+                        crate::open_path(&dir);
+                    }
+                }
+            },
             Command::Quit => return true,
         }
         false
@@ -822,9 +922,22 @@ mod tests {
     /// The expected completion remainder for an English prefix, straight from
     /// the dictionary (keeps tests independent of frequency-table contents).
     fn expected_remainder(prefix: &str) -> String {
-        let full = mxks_core::dict::complete(prefix, Lang::En)
+        let full = mxks_core::dict::complete(prefix, Lang::En, &WordUsage::default(), 0)
             .unwrap_or_else(|| panic!("dictionary has no completion for {prefix:?}"));
         full.chars().skip(prefix.chars().count()).collect()
+    }
+
+    fn expected_word(prefix: &str) -> &'static str {
+        mxks_core::dict::complete(prefix, Lang::En, &WordUsage::default(), 0)
+            .unwrap_or_else(|| panic!("dictionary has no completion for {prefix:?}"))
+    }
+
+    fn type_lowercase(engine: &mut Engine, text: &str) {
+        for c in text.chars() {
+            let key = mxks_core::layout::char_to_key(c, Lang::En)
+                .unwrap_or_else(|| panic!("no English physical key for {c:?}"));
+            engine.handle_key(letter(key));
+        }
     }
 
     /// Typing "ghbdtn " in English must produce the exact correction sequence:
@@ -1247,6 +1360,7 @@ mod tests {
     #[test]
     fn accept_types_remainder_and_space_does_not_correct() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let candidate = expected_word("hel");
         let (mut engine, overlay_rx, icontrol) = autocomplete_engine(log.clone());
 
         let (key_tx, key_rx) = crossbeam_channel::unbounded();
@@ -1266,6 +1380,115 @@ mod tests {
             matches!(overlay_rx.try_iter().last(), Some(OverlayCmd::Hide)),
             "overlay not hidden after accept"
         );
+        assert_eq!(engine.usage.usage().count(candidate, Lang::En), 1);
+    }
+
+    #[test]
+    fn exact_confirmation_counts_once_then_second_accept_is_stale() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let candidate = expected_word("hel");
+        let (mut engine, overlay_rx, icontrol) = autocomplete_engine(log.clone());
+
+        type_lowercase(&mut engine, candidate);
+        assert_eq!(
+            overlay_rx.try_iter().last(),
+            Some(OverlayCmd::Show {
+                text: "[Tab: confirm]".to_string(),
+            })
+        );
+        assert!(engine.suggestion.is_some());
+        assert!(icontrol.is_active());
+
+        engine.handle_key(accept());
+        assert!(engine.suggestion.is_none());
+        assert!(!icontrol.is_active());
+        assert_eq!(engine.usage.usage().count(candidate, Lang::En), 1);
+        assert_eq!(
+            overlay_rx.try_iter().last(),
+            Some(OverlayCmd::Hide),
+            "first exact confirmation must hide the overlay"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "exact accept must not inject"
+        );
+
+        engine.handle_key(accept());
+        assert_eq!(engine.usage.usage().count(candidate, Lang::En), 1);
+        assert_eq!(log.lock().unwrap().clone(), vec![Op::Tab]);
+    }
+
+    #[test]
+    fn learned_candidate_appears_after_one_letter() {
+        let candidate = expected_word("hel");
+        let mut usage = WordUsage::default();
+        usage.increment(candidate, Lang::En);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (engine, overlay_rx, icontrol) = autocomplete_engine(log);
+        let mut engine = engine.with_usage_store(UsageStore::memory(usage));
+
+        engine.handle_key(letter(PhysKey::H));
+
+        assert_eq!(
+            overlay_rx.try_iter().last(),
+            Some(OverlayCmd::Show {
+                text: candidate.chars().skip(1).collect(),
+            })
+        );
+        assert_eq!(engine.suggestion.as_ref().map(|s| s.word), Some(candidate));
+        assert!(icontrol.is_active());
+    }
+
+    struct FailingInjector;
+
+    impl KeyInjector for FailingInjector {
+        fn backspaces(&mut self, _n: usize) -> Result<()> {
+            Ok(())
+        }
+
+        fn type_text(&mut self, _text: &str) -> Result<()> {
+            anyhow::bail!("injected failure")
+        }
+    }
+
+    #[test]
+    fn failed_injection_does_not_count_acceptance() {
+        let candidate = expected_word("hel");
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let corrector = Corrector::new(
+            Box::new(FailingInjector),
+            Box::new(MockLayout {
+                log,
+                current: Arc::new(Mutex::new(Lang::En)),
+            }),
+        );
+        let (_hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        let (icontrol, ihandle) = mxks_platform::intercept_channel(mxks_platform::default_accept());
+        let (overlay_tx, _overlay_rx) = crossbeam_channel::unbounded();
+        let mut engine = Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle)
+            .with_autocomplete(overlay_tx, ihandle, true);
+
+        type_lowercase(&mut engine, "hel");
+        engine.handle_key(accept());
+
+        assert_eq!(engine.usage.usage().count(candidate, Lang::En), 0);
+        assert!(engine.suggestion.is_none());
+        assert!(!icontrol.is_active());
+    }
+
+    #[test]
+    fn boundary_dismissal_does_not_count_acceptance() {
+        let candidate = expected_word("hel");
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _overlay_rx, icontrol) = autocomplete_engine(log);
+
+        type_lowercase(&mut engine, "hel");
+        engine.handle_key(space());
+
+        assert_eq!(engine.usage.usage().count(candidate, Lang::En), 0);
+        assert!(engine.suggestion.is_none());
+        assert!(!icontrol.is_active());
     }
 
     /// Regression: if the system layout drifts away from the word's language

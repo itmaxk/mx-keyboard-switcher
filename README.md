@@ -20,8 +20,17 @@ single binary per OS.
   word and switch layout. Press it again with nothing typed in between to toggle
   the word back. Reassign it from the tray (**Change hotkey → press a key**) or
   in the config — matching is by key name, so any key or chord works.
-- **System tray**: enable/disable, toggle autocorrection, change the hotkey,
-  open/reload config, toggle start at login.
+- **System tray**: enable/disable, toggle autocorrection, autocomplete and
+  terminal mode, change hotkeys, export/import autocomplete counters, open/reload
+  config, toggle start at login.
+- **Autocomplete learning**: only accepting a shown completion (including
+  manually finishing that same suggestion and confirming it) increments its
+  local word counter. Learned words can appear after one character and rank by
+  counter; every suggestion must match the complete prefix.
+- **Portable local counters**: canonical state is stored at
+  `autocomplete-usage.toml`; export/import uses
+  `autocomplete-usage-transfer.toml` beside `config.toml`. Import merges the
+  maximum count per word. No network access is used.
 - **TOML config** with per-app and per-word exclusions and a custom dictionary.
 - **Privacy**: no network access at all; nothing leaves your machine.
 

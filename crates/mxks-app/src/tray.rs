@@ -181,6 +181,22 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
                     ..Default::default()
                 }
                 .into(),
+                StandardItem {
+                    label: "Export autocomplete counters".into(),
+                    activate: Box::new(|tray: &mut AppTray| {
+                        let _ = tray.cmd_tx.send(Command::ExportAutocompleteCounters);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Import autocomplete counters".into(),
+                    activate: Box::new(|tray: &mut AppTray| {
+                        let _ = tray.cmd_tx.send(Command::ImportAutocompleteCounters);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
                 CheckmarkItem {
                     label: "Start at login".into(),
                     checked: view.autostart,
@@ -256,6 +272,8 @@ mod native {
     const SET_ACCEPT_KEY: &str = "set-accept-key";
     const OPEN_CONFIG: &str = "open-config";
     const RELOAD_CONFIG: &str = "reload-config";
+    const EXPORT_AUTOCOMPLETE_COUNTERS: &str = "export-autocomplete-counters";
+    const IMPORT_AUTOCOMPLETE_COUNTERS: &str = "import-autocomplete-counters";
     const TOGGLE_AUTOSTART: &str = "toggle-autostart";
     const QUIT: &str = "quit";
 
@@ -342,6 +360,18 @@ mod native {
             );
             let open_config = MenuItem::with_id(OPEN_CONFIG, "Open config file", true, None);
             let reload_config = MenuItem::with_id(RELOAD_CONFIG, "Reload config", true, None);
+            let export_autocomplete_counters = MenuItem::with_id(
+                EXPORT_AUTOCOMPLETE_COUNTERS,
+                "Export autocomplete counters",
+                true,
+                None,
+            );
+            let import_autocomplete_counters = MenuItem::with_id(
+                IMPORT_AUTOCOMPLETE_COUNTERS,
+                "Import autocomplete counters",
+                true,
+                None,
+            );
             let autostart = CheckMenuItem::with_id(
                 TOGGLE_AUTOSTART,
                 "Start at login",
@@ -362,6 +392,8 @@ mod native {
                 &PredefinedMenuItem::separator(),
                 &open_config,
                 &reload_config,
+                &export_autocomplete_counters,
+                &import_autocomplete_counters,
                 &autostart,
                 &PredefinedMenuItem::separator(),
                 &quit,
@@ -452,6 +484,8 @@ mod native {
             SET_ACCEPT_KEY => Some(Command::SetAcceptKey),
             OPEN_CONFIG => Some(Command::OpenConfig),
             RELOAD_CONFIG => Some(Command::ReloadConfig),
+            EXPORT_AUTOCOMPLETE_COUNTERS => Some(Command::ExportAutocompleteCounters),
+            IMPORT_AUTOCOMPLETE_COUNTERS => Some(Command::ImportAutocompleteCounters),
             TOGGLE_AUTOSTART => Some(Command::ToggleAutostart),
             QUIT => Some(Command::Quit),
             _ => None,
@@ -611,6 +645,14 @@ mod native_tests {
             ("set-accept-key", Command::SetAcceptKey),
             ("open-config", Command::OpenConfig),
             ("reload-config", Command::ReloadConfig),
+            (
+                "export-autocomplete-counters",
+                Command::ExportAutocompleteCounters,
+            ),
+            (
+                "import-autocomplete-counters",
+                Command::ImportAutocompleteCounters,
+            ),
             ("toggle-autostart", Command::ToggleAutostart),
             ("quit", Command::Quit),
         ];
