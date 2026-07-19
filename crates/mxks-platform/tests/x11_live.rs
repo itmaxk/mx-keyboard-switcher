@@ -13,28 +13,39 @@ use mxks_core::keycode::PhysKey;
 use mxks_core::layout::Lang;
 use mxks_platform::{backend, Backend, KeyKind};
 
-/// Synthesize a real (non-injected, untagged) key tap via XTEST on a fresh
-/// connection, as if a physical key were pressed.
+/// Shared connection for synthesizing "real" input. A per-tap ephemeral
+/// connection is unreliable: closing it immediately after `flush` races the
+/// server's request processing, and the fake event is sometimes silently lost
+/// (observed on Xvfb). One persistent connection plus a round-trip after every
+/// batch makes synthesized input deterministic.
+fn raw_conn() -> &'static std::sync::Mutex<x11rb::rust_connection::RustConnection> {
+    use std::sync::{Mutex, OnceLock};
+    use x11rb::rust_connection::RustConnection;
+    static CONN: OnceLock<Mutex<RustConnection>> = OnceLock::new();
+    CONN.get_or_init(|| Mutex::new(RustConnection::connect(None).unwrap().0))
+}
+
+/// Synthesize a real (non-injected, untagged) key tap via XTEST, as if a
+/// physical key were pressed. Round-trips so the server has processed it.
 fn raw_tap(x_keycode: u8) {
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
+    use x11rb::protocol::xproto::{ConnectionExt as _, KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
     use x11rb::protocol::xtest::ConnectionExt as _;
-    use x11rb::rust_connection::RustConnection;
-    let (conn, _) = RustConnection::connect(None).unwrap();
+    let conn = raw_conn().lock().unwrap();
     conn.xtest_fake_input(KEY_PRESS_EVENT, x_keycode, 0, x11rb::NONE, 0, 0, 0)
         .unwrap();
     conn.xtest_fake_input(KEY_RELEASE_EVENT, x_keycode, 0, x11rb::NONE, 0, 0, 0)
         .unwrap();
     conn.flush().unwrap();
+    conn.get_input_focus().unwrap().reply().unwrap();
 }
 
 /// Press or release a single keycode (no auto-release), to build sequences.
 fn raw_key(x_keycode: u8, press: bool) {
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
+    use x11rb::protocol::xproto::{ConnectionExt as _, KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
     use x11rb::protocol::xtest::ConnectionExt as _;
-    use x11rb::rust_connection::RustConnection;
-    let (conn, _) = RustConnection::connect(None).unwrap();
+    let conn = raw_conn().lock().unwrap();
     let ty = if press {
         KEY_PRESS_EVENT
     } else {
@@ -43,6 +54,7 @@ fn raw_key(x_keycode: u8, press: bool) {
     conn.xtest_fake_input(ty, x_keycode, 0, x11rb::NONE, 0, 0, 0)
         .unwrap();
     conn.flush().unwrap();
+    conn.get_input_focus().unwrap().reply().unwrap();
 }
 
 /// Resolve the keycode currently mapped to `keysym`; live servers differ
@@ -488,6 +500,296 @@ fn intercept_resolves_and_grabs_right_arrow() {
     assert!(
         saw_accept,
         "intercept did not resolve + grab the Right arrow accept key"
+    );
+}
+
+/// Synthesize a real mouse button press+release via XTEST.
+fn raw_click(button: u8) {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt as _, BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT};
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    let conn = raw_conn().lock().unwrap();
+    conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, x11rb::NONE, 0, 0, 0)
+        .unwrap();
+    conn.flush().unwrap();
+    conn.get_input_focus().unwrap().reply().unwrap();
+}
+
+/// Wait until capture is demonstrably live: tap `g` until its Letter arrives,
+/// then drain everything queued (the very first taps can race RECORD enabling).
+fn warm_up_capture(rx: &crossbeam_channel::Receiver<mxks_platform::KeyEvent>) {
+    let g = keycode_of(XK_G);
+    let mut alive = false;
+    for _ in 0..30 {
+        raw_tap(g);
+        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) {
+            if matches!(
+                ev.kind,
+                KeyKind::Letter {
+                    key: PhysKey::G,
+                    ..
+                }
+            ) {
+                alive = true;
+            }
+        }
+        if alive {
+            break;
+        }
+    }
+    assert!(alive, "capture never reported the warm-up key");
+    std::thread::sleep(Duration::from_millis(100));
+    let _: Vec<_> = rx.try_iter().collect();
+}
+
+/// The doubling regression (first correction after a window switch): a full
+/// correction — erase + retype + trailing space — must leak zero echoes into
+/// capture, and must leave the suppression counters clean so the *next real
+/// keystroke* is not eaten. A stale counter here is exactly what corrupted the
+/// first correction in a newly focused window.
+#[test]
+#[ignore = "requires a live X server with ru/us layouts"]
+fn full_correction_suppresses_echoes_and_keeps_counters_clean() {
+    require_isolated_display();
+    let Backend {
+        mut capture,
+        mut injector,
+        mut layout,
+        ..
+    } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    warm_up_capture(&rx);
+
+    // The user "types" ghbdtn + space; drain those 7 real events.
+    layout.switch_to(Lang::En).expect("switch en");
+    for keysym in [0x67, 0x68, 0x62, 0x64, 0x74, 0x6e, 0x20u32] {
+        raw_tap(keycode_of(keysym));
+    }
+    let mut real = 0;
+    while real < 7 {
+        let ev = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("typed events did not all arrive");
+        assert!(
+            matches!(ev.kind, KeyKind::Letter { .. } | KeyKind::Boundary { .. }),
+            "unexpected event for typed key: {ev:?}"
+        );
+        real += 1;
+    }
+
+    // The correction: switch group, erase "ghbdtn " (7), retype "привет" + " ".
+    layout.switch_to(Lang::Ru).expect("switch ru");
+    injector
+        .replace_text(7, "привет", " ")
+        .expect("replace_text");
+
+    // Nothing of the injection may surface as engine events.
+    std::thread::sleep(Duration::from_millis(200));
+    let leaked: Vec<_> = rx.try_iter().collect();
+    assert!(
+        leaked.is_empty(),
+        "correction echoes leaked to capture: {leaked:?}"
+    );
+
+    // And no stale counter may eat the user's next real keystroke — the exact
+    // first-word-in-the-next-window failure.
+    raw_tap(keycode_of(XK_G));
+    let ev = rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("the first real keystroke after a correction was eaten");
+    assert!(
+        matches!(
+            ev.kind,
+            KeyKind::Letter {
+                key: PhysKey::G,
+                ..
+            }
+        ),
+        "unexpected event for the post-correction keystroke: {ev:?}"
+    );
+    assert!(
+        rx.try_iter().next().is_none(),
+        "the post-correction keystroke surfaced more than once"
+    );
+
+    layout.switch_to(Lang::En).ok(); // leave the system on English
+}
+
+/// A real Space racing an injection must not multiply word boundaries: at most
+/// one Boundary may surface around the race, and once the injection is over a
+/// fresh real Space must surface exactly once (no counter was left stale, none
+/// was stolen).
+#[test]
+#[ignore = "requires a live X server with ru/us layouts"]
+fn real_space_racing_injection_cannot_duplicate_boundary() {
+    require_isolated_display();
+    let Backend {
+        mut capture,
+        mut injector,
+        ..
+    } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    warm_up_capture(&rx);
+
+    // Fire a real Space and immediately inject a word + trailing space.
+    raw_tap(keycode_of(0x20));
+    injector.type_text("привет ").expect("type_text");
+
+    std::thread::sleep(Duration::from_millis(300));
+    let boundaries = rx
+        .try_iter()
+        .filter(|ev| matches!(ev.kind, KeyKind::Boundary { .. }))
+        .count();
+    assert!(
+        boundaries <= 1,
+        "a single real Space surfaced as {boundaries} boundaries"
+    );
+
+    // Past the staleness deadline, fresh Spaces must surface one-for-one:
+    // none eaten by a leftover counter, none duplicated. Tap several times and
+    // compare totals rather than pairing tap-to-event, because the Xvfb RECORD
+    // stream can deliver an individual tap with up to ~1 s of latency.
+    std::thread::sleep(Duration::from_millis(600));
+    // Drain until 400 ms of silence so a late race-phase event cannot be
+    // miscounted as a fresh one.
+    while rx.recv_timeout(Duration::from_millis(400)).is_ok() {}
+    const FRESH_TAPS: usize = 3;
+    let space = keycode_of(0x20);
+    for _ in 0..FRESH_TAPS {
+        raw_tap(space);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut fresh = 0;
+    while fresh < FRESH_TAPS && std::time::Instant::now() < deadline {
+        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(200)) {
+            assert!(
+                matches!(ev.kind, KeyKind::Boundary { sep: Some(' ') }),
+                "unexpected event for a fresh Space: {ev:?}"
+            );
+            fresh += 1;
+        }
+    }
+    // Quiet period: any extra Boundary now is a duplicated Space.
+    std::thread::sleep(Duration::from_millis(300));
+    fresh += rx
+        .try_iter()
+        .filter(|ev| matches!(ev.kind, KeyKind::Boundary { .. }))
+        .count();
+    assert_eq!(
+        fresh, FRESH_TAPS,
+        "{FRESH_TAPS} fresh Spaces surfaced as {fresh} boundaries (eaten or duplicated)"
+    );
+}
+
+/// A change of `_NET_ACTIVE_WINDOW` must produce exactly one Reset per actual
+/// window change (deduped), so a stale word never leaks into a newly focused
+/// application.
+#[test]
+#[ignore = "requires a live X server"]
+fn focus_change_emits_reset() {
+    require_isolated_display();
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::rust_connection::RustConnection;
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let Backend { mut capture, .. } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    warm_up_capture(&rx);
+
+    let (conn, screen) = RustConnection::connect(None).expect("test conn");
+    let root = conn.setup().roots[screen].root;
+    let atom = conn
+        .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+        .unwrap()
+        .reply()
+        .unwrap()
+        .atom;
+    // No WM runs on the isolated Xvfb, so play the WM ourselves. The watcher
+    // only reads the property value; the ids need not be mapped windows.
+    let win_a: u32 = conn.generate_id().unwrap();
+    let win_b: u32 = conn.generate_id().unwrap();
+    let set_active = |win: u32| {
+        conn.change_property32(PropMode::REPLACE, root, atom, AtomEnum::WINDOW, &[win])
+            .unwrap();
+        conn.flush().unwrap();
+    };
+
+    let resets_within = |ms: u64| -> usize {
+        let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+        let mut n = 0;
+        while std::time::Instant::now() < deadline {
+            while let Ok(ev) = rx.try_recv() {
+                if ev.kind == KeyKind::Reset {
+                    n += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        n
+    };
+
+    set_active(win_a);
+    assert_eq!(
+        resets_within(500),
+        1,
+        "focus change A did not emit one Reset"
+    );
+    set_active(win_a); // rewrite with the same id: WMs do this constantly
+    assert_eq!(resets_within(300), 0, "same-window rewrite was not deduped");
+    set_active(win_b);
+    assert_eq!(
+        resets_within(500),
+        1,
+        "focus change B did not emit one Reset"
+    );
+}
+
+/// A mouse click (buttons 1-3) moves the caret, so it must reset the word
+/// buffer; wheel scrolling must not.
+#[test]
+#[ignore = "requires a live X server"]
+fn mouse_click_emits_reset_but_wheel_does_not() {
+    require_isolated_display();
+    let Backend { mut capture, .. } = backend(HotkeySpec::default()).expect("backend");
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::spawn(move || {
+        let _ = capture.run(tx);
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    warm_up_capture(&rx);
+
+    raw_click(1);
+    let ev = rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("left click produced no event");
+    assert_eq!(ev.kind, KeyKind::Reset, "left click must reset: {ev:?}");
+    assert!(
+        rx.try_iter().next().is_none(),
+        "left click produced more than one event"
+    );
+
+    raw_click(4); // wheel up
+    std::thread::sleep(Duration::from_millis(200));
+    let extra: Vec<_> = rx.try_iter().collect();
+    assert!(
+        extra.is_empty(),
+        "wheel scroll must not reset the buffer: {extra:?}"
     );
 }
 

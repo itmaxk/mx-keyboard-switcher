@@ -8,7 +8,12 @@
 //! corrupted characters).
 //!
 //! Every injected key-press is registered with [`Suppress`] so the capture
-//! thread drops its own echo.
+//! thread drops its own echo. Each injected batch additionally runs inside a
+//! [`Suppress`] injection window and ends with a server round-trip: when an
+//! injection method returns, every fake event has been processed by the server
+//! and its echo is already ordered into the RECORD stream, ahead of whatever
+//! the user presses next. That ordering is what keeps the per-keycode echo
+//! counters consuming the right events.
 
 use anyhow::Result;
 use mxks_core::layout::{char_to_key, is_letter_of, to_lower, Lang};
@@ -44,6 +49,17 @@ impl X11Injector {
             suppress,
             modifier_keycodes,
         })
+    }
+
+    /// Run one injected batch: open the suppression window, send the fake
+    /// events, then round-trip so the server has processed them all before we
+    /// return (their echoes are then already ordered into the RECORD stream).
+    fn injected<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self.suppress.injection();
+        let out = f()?;
+        self.conn.flush()?;
+        self.conn.get_input_focus()?.reply()?;
+        Ok(out)
     }
 
     /// Fake-release every modifier key so injected taps are unmodified. A
@@ -106,27 +122,44 @@ impl X11Injector {
 
 impl crate::KeyInjector for X11Injector {
     fn backspaces(&mut self, n: usize) -> Result<()> {
-        self.clear_modifiers()?;
-        for _ in 0..n {
-            self.tap_key(KC_BACKSPACE, false)?;
-        }
-        self.conn.flush()?;
-        Ok(())
+        self.injected(|| {
+            self.clear_modifiers()?;
+            for _ in 0..n {
+                self.tap_key(KC_BACKSPACE, false)?;
+            }
+            Ok(())
+        })
     }
 
     fn type_text(&mut self, text: &str) -> Result<()> {
-        self.clear_modifiers()?;
-        for c in text.chars() {
-            self.tap_char(c)?;
-        }
-        self.conn.flush()?;
-        Ok(())
+        self.injected(|| {
+            self.clear_modifiers()?;
+            for c in text.chars() {
+                self.tap_char(c)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// One window + one round-trip for the whole erase-and-retype sequence, so
+    /// a correction is a single atomic batch from the suppressor's viewpoint.
+    fn replace_text(&mut self, erase: usize, text: &str, trailing: &str) -> Result<()> {
+        self.injected(|| {
+            self.clear_modifiers()?;
+            for _ in 0..erase {
+                self.tap_key(KC_BACKSPACE, false)?;
+            }
+            for c in text.chars().chain(trailing.chars()) {
+                self.tap_char(c)?;
+            }
+            Ok(())
+        })
     }
 
     fn tab(&mut self) -> Result<()> {
-        self.clear_modifiers()?;
-        self.tap_key(KC_TAB, false)?;
-        self.conn.flush()?;
-        Ok(())
+        self.injected(|| {
+            self.clear_modifiers()?;
+            self.tap_key(KC_TAB, false)
+        })
     }
 }

@@ -15,11 +15,13 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
 use x11rb::connection::Connection;
 use x11rb::protocol::record::{self, ConnectionExt as _};
-use x11rb::protocol::xproto::{ConnectionExt as _, KEY_PRESS_EVENT, KEY_RELEASE_EVENT};
+use x11rb::protocol::xproto::{
+    ConnectionExt as _, BUTTON_PRESS_EVENT, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
+};
 use x11rb::rust_connection::RustConnection;
 
 use super::keymap::{self, KC_BACKSPACE};
-use super::suppress::Suppress;
+use super::suppress::{Filter, Suppress};
 use crate::event::{KeyEvent, KeyKind};
 use crate::{HotkeyControl, InterceptControl};
 use mxks_core::hotkey::HotkeySpec;
@@ -202,6 +204,20 @@ impl X11Capture {
     /// Handle one 32-byte core event slice; forward an engine event if relevant.
     fn on_event(&self, data: &[u8], tx: &Sender<KeyEvent>) -> Result<()> {
         let response_type = data[0] & 0x7f;
+        if response_type == BUTTON_PRESS_EVENT {
+            // A click (buttons 1-3) moves the caret or the focus, so the
+            // in-progress word no longer matches what is on screen. Wheel
+            // scrolling (4/5, incl. horizontal 6/7) leaves the caret alone.
+            let button = data[1];
+            if (1..=3).contains(&button) {
+                let _ = tx.send(KeyEvent {
+                    kind: KeyKind::Reset,
+                    down: true,
+                    injected: false,
+                });
+            }
+            return Ok(());
+        }
         if response_type != KEY_PRESS_EVENT {
             let _ = KEY_RELEASE_EVENT; // we act only on key-down
             return Ok(());
@@ -209,8 +225,13 @@ impl X11Capture {
         let keycode = data[1];
         let state = u16::from_le_bytes([data[28], data[29]]);
 
-        if self.suppress.should_drop(keycode) {
-            return Ok(());
+        match self.suppress.filter(keycode) {
+            Filter::DropEcho => return Ok(()),
+            Filter::DropInjecting => {
+                tracing::trace!("dropping keycode {keycode} pressed during injection");
+                return Ok(());
+            }
+            Filter::Real => {}
         }
 
         // While the accept key is grabbed (suggestion visible), XRecord still
@@ -254,6 +275,9 @@ impl crate::KeyCapture for X11Capture {
         // until the engine activates it for a visible suggestion.
         super::intercept::spawn(self.intercept.clone(), tx.clone());
 
+        // Focus watcher: resets the word buffer when the active window changes.
+        super::focus_watch::spawn(tx.clone());
+
         let (ctrl_conn, _) = RustConnection::connect(None).context("RECORD control connection")?;
         let (data_conn, _) = RustConnection::connect(None).context("RECORD data connection")?;
 
@@ -271,7 +295,7 @@ impl crate::KeyCapture for X11Capture {
             delivered_events: empty8,
             device_events: record::Range8 {
                 first: KEY_PRESS_EVENT,
-                last: KEY_RELEASE_EVENT,
+                last: BUTTON_PRESS_EVENT, // KeyPress, KeyRelease, ButtonPress
             },
             errors: empty8,
             client_started: false,

@@ -27,6 +27,8 @@ pipeline. These manual steps verify end-to-end behaviour in real apps on each OS
 | 10 | Edit config `threshold`, Tray → **Reload config** | New value takes effect |
 | 11 | Import `готово=7`, type `г`, then continue to `готи` | `готово` is suggested after `г`; it disappears or changes at `готи` because the full prefix must match |
 | 12 | Type the shown `готово` completion manually, then press the accept key | Overlay shows `[Tab: confirm]`; confirmation does not change text and stores exactly one new accept |
+| 13 | Type `ghb` in an editor, click into a browser text field, type `ghbdtn` then Space | Exactly `привет ` appears — no doubled or leftover characters; the editor's `ghb` is forgotten (the hotkey converts nothing) |
+| 14 | Repeat #13 but switch windows with Alt+Tab instead of clicking | Same: exactly `привет `, first correction in the new window is clean |
 
 ## Tray and icon (run on every OS)
 

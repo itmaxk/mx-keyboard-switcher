@@ -2,6 +2,7 @@
 //! XKB for layout read/switch. Wayland is not supported for global capture; on
 //! a Wayland session we require XWayland (a set `DISPLAY`) and warn.
 
+mod focus_watch;
 mod inject;
 mod intercept;
 mod keymap;

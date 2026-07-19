@@ -1,6 +1,8 @@
 //! The engine: consumes key events and tray commands, maintains the word
 //! buffer, and drives detection + correction.
 
+use std::time::{Duration, Instant};
+
 use crossbeam_channel::{Receiver, Sender};
 use mxks_core::buffer::{Event, Word, WordBuffer};
 use mxks_core::config::Config;
@@ -14,6 +16,11 @@ use mxks_platform::{
 
 use crate::corrector::Corrector;
 use crate::usage_io::UsageStore;
+
+/// How long after a correction's injection a completed "word" is still assumed
+/// to be a leaked echo of that injection rather than human typing. A person
+/// cannot type a whole word this fast; a leaked echo replays instantly.
+const AUTOCORRECT_COOLDOWN: Duration = Duration::from_millis(150);
 
 /// Commands sent from the tray (or other UI) to the engine.
 // Some variants are only constructed by the tray, which is compiled out on
@@ -110,6 +117,9 @@ pub struct Engine {
     last: Option<(Word, String)>,
     /// State for toggling the last manual conversion back and forth.
     toggle: Option<Toggle>,
+    /// When the last correction was injected; words completed within
+    /// [`AUTOCORRECT_COOLDOWN`] of it are treated as leaked echoes.
+    last_correction: Option<Instant>,
     /// Broadcasts status changes so the tray can update its menu.
     status_tx: Option<Sender<Status>>,
     /// Full dictionary candidate currently offered to the user.
@@ -146,6 +156,7 @@ impl Engine {
             capturing: false,
             last: None,
             toggle: None,
+            last_correction: None,
             status_tx: None,
             suggestion: None,
             usage: UsageStore::memory(WordUsage::default()),
@@ -476,6 +487,18 @@ impl Engine {
 
     fn on_word(&mut self, word: Word, sep: Option<char>) {
         let trailing = sep.map(|c| c.to_string()).unwrap_or_default();
+
+        // A word completed this soon after our own injection cannot be human
+        // typing — it is a leaked echo of the correction replaying itself.
+        // Never let it trigger a second correction or arm the manual hotkey.
+        if self
+            .last_correction
+            .is_some_and(|t| t.elapsed() < AUTOCORRECT_COOLDOWN)
+        {
+            tracing::debug!("word completed within post-correction cooldown; ignoring it");
+            self.last = None;
+            return;
+        }
         self.last = Some((word.clone(), trailing.clone()));
 
         if !self.enabled || !self.config.general.autocorrect {
@@ -520,6 +543,7 @@ impl Engine {
                 Ok(()) => {
                     self.active = to;
                     self.last = None;
+                    self.last_correction = Some(Instant::now());
                     tracing::debug!("corrected -> {conv}");
                 }
                 Err(e) => tracing::warn!("autocorrect failed: {e:#}"),
@@ -547,6 +571,7 @@ impl Engine {
             match self.corrector.convert(&t.keys, t.lang, to, &t.trailing) {
                 Ok(()) => {
                     self.active = to;
+                    self.last_correction = Some(Instant::now());
                     self.buffer.set_lang(self.active);
                     self.toggle = Some(Toggle {
                         keys: t.keys,
@@ -588,6 +613,7 @@ impl Engine {
                     trailing
                 };
                 self.active = to;
+                self.last_correction = Some(Instant::now());
                 self.buffer.clear();
                 self.buffer.set_lang(self.active);
                 self.toggle = Some(Toggle {
@@ -875,6 +901,13 @@ mod tests {
             injected: false,
         }
     }
+    fn reset() -> KeyEvent {
+        KeyEvent {
+            kind: KeyKind::Reset,
+            down: true,
+            injected: false,
+        }
+    }
 
     /// Engine with autocomplete wired to a mock overlay channel and a real
     /// intercept pair (the control side lets tests observe the active flag).
@@ -983,6 +1016,98 @@ mod tests {
                 Op::Type(" ".to_string()),
             ]
         );
+    }
+
+    /// Build a bare engine (no autocomplete) over the shared op log, starting
+    /// with the mock system layout in English.
+    fn bare_engine(log: Log) -> Engine {
+        let corrector = Corrector::new(
+            Box::new(MockInjector(log.clone())),
+            Box::new(MockLayout {
+                log,
+                current: Arc::new(Mutex::new(Lang::En)),
+            }),
+        );
+        let (_hk_ctrl, hk_handle) =
+            mxks_platform::hotkey_channel(mxks_core::hotkey::HotkeySpec::default());
+        Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle)
+    }
+
+    fn type_wrong_privet(engine: &mut Engine) {
+        for k in [
+            PhysKey::G,
+            PhysKey::H,
+            PhysKey::B,
+            PhysKey::D,
+            PhysKey::T,
+            PhysKey::N,
+        ] {
+            engine.handle_key(letter(k));
+        }
+        engine.handle_key(space());
+    }
+
+    /// A word that completes within the post-correction cooldown is a leaked
+    /// echo of our own injection and must never be auto-corrected; once the
+    /// cooldown expires, correction works again.
+    #[test]
+    fn word_within_cooldown_is_not_autocorrected() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = bare_engine(log.clone());
+
+        engine.last_correction = Some(Instant::now());
+        type_wrong_privet(&mut engine);
+        assert!(log.lock().unwrap().is_empty());
+
+        engine.last_correction = Instant::now().checked_sub(Duration::from_secs(1));
+        type_wrong_privet(&mut engine);
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                Op::Switch(Lang::Ru),
+                Op::Backspaces(7),
+                Op::Type("привет".to_string()),
+                Op::Type(" ".to_string()),
+            ]
+        );
+    }
+
+    /// A successful correction arms the cooldown: an immediate replay of the
+    /// injected sequence (a leaked echo rebuilding the buffer and completing it
+    /// with the leaked trailing space) triggers no second correction and does
+    /// not arm the manual hotkey.
+    #[test]
+    fn correction_arms_cooldown_against_echo_replay() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = bare_engine(log.clone());
+
+        type_wrong_privet(&mut engine);
+        let after_correction = log.lock().unwrap().len();
+        assert_eq!(after_correction, 4); // Switch + Backspaces + Type + Type
+
+        // The injected retype echoes straight back: same physical keys, now in
+        // the Russian group, plus the trailing space.
+        type_wrong_privet(&mut engine);
+        assert!(engine.last.is_none());
+        engine.handle_key(hotkey());
+        assert_eq!(log.lock().unwrap().len(), after_correction);
+    }
+
+    /// Reset (focus change, mouse click, arrows) forgets both the in-progress
+    /// word and the last completed one: a following space corrects nothing and
+    /// the manual hotkey has nothing to convert.
+    #[test]
+    fn reset_clears_word_and_last() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = bare_engine(log.clone());
+
+        for k in [PhysKey::G, PhysKey::H, PhysKey::B] {
+            engine.handle_key(letter(k));
+        }
+        engine.handle_key(reset());
+        engine.handle_key(space());
+        engine.handle_key(hotkey());
+        assert!(log.lock().unwrap().is_empty());
     }
 
     #[test]
