@@ -68,13 +68,13 @@ SHAPES = [
 ]
 KEY = hex_rgb("#1C2A08")
 for kx in (78, 153, 228, 303, 378):
-    SHAPES.append(RRect(kx, 168, 56, 52, 12, color=KEY))
-for kx in (115.5, 265.5, 340.5):
-    SHAPES.append(RRect(kx, 232, 56, 52, 12, color=KEY))
-SHAPES.append(RRect(78, 296, 56, 44, 12, color=KEY))
-SHAPES.append(RRect(153, 296, 206, 44, 12, color=KEY))
-SHAPES.append(RRect(378, 296, 56, 44, 12, color=KEY))
-SHAPES.append(RRect(190.5, 232, 56, 52, 12, color=hex_rgb("#F7FEE7")))
+    SHAPES.append(RRect(kx, 170, 56, 48, 12, color=KEY))
+for kx in (78, 153, 303, 378):
+    SHAPES.append(RRect(kx, 234, 56, 48, 12, color=KEY))
+SHAPES.append(RRect(78, 298, 56, 44, 12, color=KEY))
+SHAPES.append(RRect(153, 298, 206, 44, 12, color=KEY))
+SHAPES.append(RRect(378, 298, 56, 44, 12, color=KEY))
+SHAPES.append(RRect(228, 234, 56, 48, 12, color=hex_rgb("#F7FEE7")))
 
 def render(size, ss=4):
     """Render the icon at `size` px, ss x ss supersampled, -> RGBA bytes."""

@@ -21,20 +21,21 @@
   <rect x="48" y="132" width="416" height="248" rx="48" fill="url(#deck)"/>
   <!-- glossy sheen across the top of the deck -->
   <rect x="62" y="144" width="388" height="38" rx="19" fill="#FFFFFF" opacity="0.16"/>
-  <!-- key rows -->
+  <!-- key rows: a clean 5x2 grid, then the spacebar row -->
   <g fill="#1C2A08">
-    <rect x="78" y="168" width="56" height="52" rx="12"/>
-    <rect x="153" y="168" width="56" height="52" rx="12"/>
-    <rect x="228" y="168" width="56" height="52" rx="12"/>
-    <rect x="303" y="168" width="56" height="52" rx="12"/>
-    <rect x="378" y="168" width="56" height="52" rx="12"/>
-    <rect x="115.5" y="232" width="56" height="52" rx="12"/>
-    <rect x="265.5" y="232" width="56" height="52" rx="12"/>
-    <rect x="340.5" y="232" width="56" height="52" rx="12"/>
-    <rect x="78" y="296" width="56" height="44" rx="12"/>
-    <rect x="153" y="296" width="206" height="44" rx="12"/>
-    <rect x="378" y="296" width="56" height="44" rx="12"/>
+    <rect x="78" y="170" width="56" height="48" rx="12"/>
+    <rect x="153" y="170" width="56" height="48" rx="12"/>
+    <rect x="228" y="170" width="56" height="48" rx="12"/>
+    <rect x="303" y="170" width="56" height="48" rx="12"/>
+    <rect x="378" y="170" width="56" height="48" rx="12"/>
+    <rect x="78" y="234" width="56" height="48" rx="12"/>
+    <rect x="153" y="234" width="56" height="48" rx="12"/>
+    <rect x="303" y="234" width="56" height="48" rx="12"/>
+    <rect x="378" y="234" width="56" height="48" rx="12"/>
+    <rect x="78" y="298" width="56" height="44" rx="12"/>
+    <rect x="153" y="298" width="206" height="44" rx="12"/>
+    <rect x="378" y="298" width="56" height="44" rx="12"/>
   </g>
-  <!-- the accent key: the "switch" key that makes the mark unique -->
-  <rect x="190.5" y="232" width="56" height="52" rx="12" fill="#F7FEE7"/>
+  <!-- the accent key: the centered "switch" key that makes the mark unique -->
+  <rect x="228" y="234" width="56" height="48" rx="12" fill="#F7FEE7"/>
 </svg>
