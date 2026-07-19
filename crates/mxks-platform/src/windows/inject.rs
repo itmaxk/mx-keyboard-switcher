@@ -1,16 +1,24 @@
 //! Input injection via `SendInput`. Every injected event carries `dwExtraInfo
 //! == MAGIC` so the low-level hook can recognize and ignore it (clean, race-free
 //! self-event suppression).
+//!
+//! Text is typed as `KEYEVENTF_UNICODE` (VK_PACKET) units, NOT as physical
+//! scancodes. Scancodes are translated by the *receiving application* using
+//! whatever keyboard layout it has applied at that moment, and apps with their
+//! own layout handling (Qt apps like Telegram Desktop) apply
+//! `WM_INPUTLANGCHANGE` asynchronously — a correction injected right after the
+//! switch was retyped in the OLD layout ("Vbh" instead of "Мир"). Unicode
+//! injection delivers the exact characters regardless of any layout, while the
+//! system layout switch (see `layout.rs`) still happens so the user's *next*
+//! keystrokes come out in the right language.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, MapVirtualKeyExW, SendInput, VkKeyScanExW, HKL, INPUT, INPUT_0,
-    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
-    KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC_EX, VIRTUAL_KEY,
-    VK_BACK, VK_CAPITAL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
+    VK_LWIN, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_TAB,
 };
 
 use super::MAGIC;
@@ -53,126 +61,29 @@ fn append_unicode_unit(inputs: &mut Vec<INPUT>, unit: u16) {
     inputs.push(key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
 }
 
-fn scan_parts(mapped: u32) -> Option<(u16, KEYBD_EVENT_FLAGS)> {
-    let scan = (mapped & 0xff) as u16;
-    if scan == 0 {
-        return None;
-    }
-    let prefix = mapped & 0xff00;
-    let extended = if prefix == 0xe000 || prefix == 0xe100 {
-        KEYEVENTF_EXTENDEDKEY
-    } else {
-        KEYBD_EVENT_FLAGS(0)
-    };
-    Some((scan, extended))
-}
-
-fn append_scan_pair(inputs: &mut Vec<INPUT>, scan: u16, extra_flags: KEYBD_EVENT_FLAGS) {
-    let down_flags = KEYEVENTF_SCANCODE | extra_flags;
-    inputs.push(key_input(0, scan, down_flags));
-    inputs.push(key_input(0, scan, down_flags | KEYEVENTF_KEYUP));
-}
-
-fn append_physical_char(
-    inputs: &mut Vec<INPUT>,
-    ch: char,
-    unit: u16,
-    hkl: HKL,
-    caps_lock: bool,
-) -> bool {
-    let mapping = unsafe { VkKeyScanExW(unit, hkl) };
-    if mapping == -1 {
-        return false;
-    }
-
-    let vk = (mapping as u16 & 0xff) as u32;
-    let modifiers = ((mapping as u16 >> 8) & 0xff) as u8;
-    if modifiers & !1 != 0 {
-        return false;
-    }
-    let mapped_char = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_CHAR, Some(hkl)) };
-    if mapped_char & 0x8000_0000 != 0 {
-        return false;
-    }
-    let Some((scan, extra_flags)) =
-        scan_parts(unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, Some(hkl)) })
-    else {
-        return false;
-    };
-
-    let required_shift = modifiers & 1 != 0;
-    let use_shift = if ch.is_alphabetic() {
-        required_shift ^ caps_lock
-    } else {
-        required_shift
-    };
-    let shift_scan = if use_shift {
-        scan_parts(unsafe { MapVirtualKeyExW(VK_SHIFT.0 as u32, MAPVK_VK_TO_VSC_EX, Some(hkl)) })
-    } else {
-        None
-    };
-    if use_shift && shift_scan.is_none() {
-        return false;
-    }
-
-    if let Some((shift_scan, shift_flags)) = shift_scan {
-        append_scan_pair_down(inputs, shift_scan, shift_flags);
-    }
-    append_scan_pair(inputs, scan, extra_flags);
-    if let Some((shift_scan, shift_flags)) = shift_scan {
-        append_scan_pair_up(inputs, shift_scan, shift_flags);
-    }
-    true
-}
-
-fn append_scan_pair_down(inputs: &mut Vec<INPUT>, scan: u16, extra_flags: KEYBD_EVENT_FLAGS) {
-    inputs.push(key_input(0, scan, KEYEVENTF_SCANCODE | extra_flags));
-}
-
-fn append_scan_pair_up(inputs: &mut Vec<INPUT>, scan: u16, extra_flags: KEYBD_EVENT_FLAGS) {
-    inputs.push(key_input(
-        0,
-        scan,
-        KEYEVENTF_SCANCODE | extra_flags | KEYEVENTF_KEYUP,
-    ));
-}
-
-fn append_text_inputs(inputs: &mut Vec<INPUT>, text: &str, hkl: HKL, caps_lock: bool) {
-    for ch in text.chars() {
-        let mut units = [0; 2];
-        let encoded = ch.encode_utf16(&mut units);
-        if encoded.len() == 1 && append_physical_char(inputs, ch, encoded[0], hkl, caps_lock) {
-            continue;
-        }
-        for unit in encoded {
-            append_unicode_unit(inputs, *unit);
-        }
+fn append_text_inputs(inputs: &mut Vec<INPUT>, text: &str) {
+    for unit in text.encode_utf16() {
+        append_unicode_unit(inputs, unit);
     }
 }
 
-fn text_inputs(text: &str, hkl: HKL, caps_lock: bool) -> Vec<INPUT> {
-    let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 4);
-    append_text_inputs(&mut inputs, text, hkl, caps_lock);
+fn text_inputs(text: &str) -> Vec<INPUT> {
+    let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
+    append_text_inputs(&mut inputs, text);
     inputs
 }
 
-fn replacement_inputs(
-    erase: usize,
-    text: &str,
-    trailing: &str,
-    hkl: HKL,
-    caps_lock: bool,
-) -> Vec<INPUT> {
+fn replacement_inputs(erase: usize, text: &str, trailing: &str) -> Vec<INPUT> {
     let mut inputs = Vec::with_capacity(
         erase
             .saturating_mul(2)
-            .saturating_add((text.len() + trailing.len()).saturating_mul(4)),
+            .saturating_add((text.len() + trailing.len()).saturating_mul(2)),
     );
     for _ in 0..erase {
         append_vk_pair(&mut inputs, VK_BACK);
     }
-    append_text_inputs(&mut inputs, text, hkl, caps_lock);
-    append_text_inputs(&mut inputs, trailing, hkl, caps_lock);
+    append_text_inputs(&mut inputs, text);
+    append_text_inputs(&mut inputs, trailing);
     inputs
 }
 
@@ -202,12 +113,6 @@ fn wait_for_modifiers_released() -> Result<()> {
     }
 }
 
-fn foreground_layout() -> Result<(HKL, bool)> {
-    let keyboard = super::foreground_keyboard()?;
-    let caps_lock = unsafe { GetKeyState(VK_CAPITAL.0 as i32) } & 1 != 0;
-    Ok((keyboard.hkl, caps_lock))
-}
-
 impl crate::KeyInjector for WinInjector {
     fn backspaces(&mut self, n: usize) -> Result<()> {
         let mut inputs = Vec::with_capacity(n.saturating_mul(2));
@@ -225,9 +130,7 @@ impl crate::KeyInjector for WinInjector {
             return Ok(());
         }
         wait_for_modifiers_released()?;
-        let (hkl, caps_lock) = foreground_layout()?;
-        let inputs = text_inputs(text, hkl, caps_lock);
-        send(&inputs)
+        send(&text_inputs(text))
     }
 
     fn replace_text(&mut self, erase: usize, text: &str, trailing: &str) -> Result<()> {
@@ -235,9 +138,7 @@ impl crate::KeyInjector for WinInjector {
             return Ok(());
         }
         wait_for_modifiers_released()?;
-        let (hkl, caps_lock) = foreground_layout()?;
-        let inputs = replacement_inputs(erase, text, trailing, hkl, caps_lock);
-        send(&inputs)
+        send(&replacement_inputs(erase, text, trailing))
     }
 
     fn tab(&mut self) -> Result<()> {
@@ -251,12 +152,6 @@ impl crate::KeyInjector for WinInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::core::w;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{LoadKeyboardLayoutW, KLF_SUBSTITUTE_OK};
-
-    fn load_layout(klid: windows::core::PCWSTR) -> HKL {
-        unsafe { LoadKeyboardLayoutW(klid, KLF_SUBSTITUTE_OK).unwrap() }
-    }
 
     fn keyboard(input: &INPUT) -> KEYBDINPUT {
         unsafe { input.Anonymous.ki }
@@ -268,54 +163,7 @@ mod tests {
             .all(|input| keyboard(input).dwExtraInfo == MAGIC));
     }
 
-    fn assert_no_unicode(inputs: &[INPUT]) {
-        assert!(inputs
-            .iter()
-            .all(|input| keyboard(input).dwFlags.0 & KEYEVENTF_UNICODE.0 == 0));
-    }
-
-    #[test]
-    fn russian_word_uses_one_scancode_pair_per_letter() {
-        let inputs = text_inputs("капельки", load_layout(w!("00000419")), false);
-        assert_eq!(inputs.len(), 16);
-        assert_no_unicode(&inputs);
-        assert_tagged(&inputs);
-        for pair in inputs.chunks_exact(2) {
-            let down = keyboard(&pair[0]);
-            let up = keyboard(&pair[1]);
-            assert_eq!(down.wVk.0, 0);
-            assert_ne!(down.dwFlags.0 & KEYEVENTF_SCANCODE.0, 0);
-            assert_eq!(down.wScan, up.wScan);
-            assert_eq!(up.dwFlags.0, down.dwFlags.0 | KEYEVENTF_KEYUP.0);
-        }
-    }
-
-    #[test]
-    fn caps_lock_preserves_mixed_case_without_unicode() {
-        let hkl = load_layout(w!("00000419"));
-        let caps_off = text_inputs("Привет", hkl, false);
-        let caps_on = text_inputs("Привет", hkl, true);
-        assert_no_unicode(&caps_off);
-        assert_no_unicode(&caps_on);
-        assert_eq!(caps_off.len(), 14);
-        assert_eq!(caps_on.len(), 22);
-        assert_tagged(&caps_off);
-        assert_tagged(&caps_on);
-    }
-
-    #[test]
-    fn yo_and_space_use_physical_keys() {
-        let inputs = text_inputs("ё ", load_layout(w!("00000419")), false);
-        assert_eq!(inputs.len(), 4);
-        assert_no_unicode(&inputs);
-        assert_tagged(&inputs);
-    }
-
-    #[test]
-    fn surrogate_pair_falls_back_to_complete_unicode_lifecycles() {
-        let inputs = text_inputs("💧", load_layout(w!("00000409")), false);
-        assert_eq!(inputs.len(), 4);
-        assert_tagged(&inputs);
+    fn assert_unicode_pairs(inputs: &[INPUT]) {
         for pair in inputs.chunks_exact(2) {
             let down = keyboard(&pair[0]);
             let up = keyboard(&pair[1]);
@@ -327,11 +175,37 @@ mod tests {
     }
 
     #[test]
+    fn russian_word_uses_one_unicode_pair_per_letter() {
+        let inputs = text_inputs("капельки");
+        assert_eq!(inputs.len(), 16);
+        assert_tagged(&inputs);
+        assert_unicode_pairs(&inputs);
+    }
+
+    #[test]
+    fn mixed_case_is_exact_regardless_of_caps_state() {
+        // Unicode units carry the exact character, so case never depends on
+        // CapsLock or Shift.
+        let inputs = text_inputs("Привет");
+        assert_eq!(inputs.len(), 12);
+        assert_tagged(&inputs);
+        assert_unicode_pairs(&inputs);
+        assert_eq!(keyboard(&inputs[0]).wScan, 'П' as u16);
+    }
+
+    #[test]
+    fn surrogate_pair_emits_two_complete_unit_lifecycles() {
+        let inputs = text_inputs("💧");
+        assert_eq!(inputs.len(), 4);
+        assert_tagged(&inputs);
+        assert_unicode_pairs(&inputs);
+    }
+
+    #[test]
     fn replacement_is_one_tagged_batch() {
-        let inputs = replacement_inputs(9, "капельки", " ", load_layout(w!("00000419")), false);
+        let inputs = replacement_inputs(9, "капельки", " ");
         assert_eq!(inputs.len(), 36);
         assert_tagged(&inputs);
-        assert_no_unicode(&inputs);
         for pair in inputs[..18].chunks_exact(2) {
             assert_eq!(keyboard(&pair[0]).wVk, VK_BACK);
             assert_eq!(keyboard(&pair[1]).wVk, VK_BACK);
@@ -340,5 +214,6 @@ mod tests {
                 keyboard(&pair[0]).dwFlags | KEYEVENTF_KEYUP
             );
         }
+        assert_unicode_pairs(&inputs[18..]);
     }
 }
