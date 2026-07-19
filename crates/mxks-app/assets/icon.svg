@@ -1,8 +1,40 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-  <path d="M84 404V112L155 250L226 112V404" fill="none" stroke="#4F46E5" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M292 116L426 396" fill="none" stroke="#84CC16" stroke-width="56" stroke-linecap="round"/>
-  <path d="M426 116L292 396" fill="none" stroke="#84CC16" stroke-width="56" stroke-linecap="round"/>
-  <path d="M200 210L250 256L200 302Z" fill="#4F46E5"/>
-  <path d="M318 210L268 256L318 302Z" fill="#84CC16"/>
+  <!-- Premium lime keyboard mark. Keep geometry in sync with
+       scripts/gen-icons.py, which rasterizes the same shapes. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2A3A0E"/>
+      <stop offset="1" stop-color="#0C1203"/>
+    </linearGradient>
+    <linearGradient id="deck" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ECFCCB"/>
+      <stop offset="0.5" stop-color="#A3E635"/>
+      <stop offset="1" stop-color="#65A30D"/>
+    </linearGradient>
+  </defs>
+  <!-- rim + background -->
+  <rect x="0" y="0" width="512" height="512" rx="116" fill="#3F6212"/>
+  <rect x="5" y="5" width="502" height="502" rx="111" fill="url(#bg)"/>
+  <!-- keyboard deck: drop edge, then the lime face -->
+  <rect x="48" y="142" width="416" height="248" rx="48" fill="#365314"/>
+  <rect x="48" y="132" width="416" height="248" rx="48" fill="url(#deck)"/>
+  <!-- glossy sheen across the top of the deck -->
+  <rect x="62" y="144" width="388" height="38" rx="19" fill="#FFFFFF" opacity="0.16"/>
+  <!-- key rows -->
+  <g fill="#1C2A08">
+    <rect x="78" y="168" width="56" height="52" rx="12"/>
+    <rect x="153" y="168" width="56" height="52" rx="12"/>
+    <rect x="228" y="168" width="56" height="52" rx="12"/>
+    <rect x="303" y="168" width="56" height="52" rx="12"/>
+    <rect x="378" y="168" width="56" height="52" rx="12"/>
+    <rect x="115.5" y="232" width="56" height="52" rx="12"/>
+    <rect x="265.5" y="232" width="56" height="52" rx="12"/>
+    <rect x="340.5" y="232" width="56" height="52" rx="12"/>
+    <rect x="78" y="296" width="56" height="44" rx="12"/>
+    <rect x="153" y="296" width="206" height="44" rx="12"/>
+    <rect x="378" y="296" width="56" height="44" rx="12"/>
+  </g>
+  <!-- the accent key: the "switch" key that makes the mark unique -->
+  <rect x="190.5" y="232" width="56" height="52" rx="12" fill="#F7FEE7"/>
 </svg>

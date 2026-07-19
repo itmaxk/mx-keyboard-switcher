@@ -73,7 +73,7 @@ Run these checks with the default `tray` feature enabled:
   Xephyr display such as `DISPLAY=:99` with its own D-Bus session and an
   SNI-capable panel. Do not point the nested session at the host D-Bus.
 - In that isolated session, run the common tray checks above. Confirm the panel
-  renders the embedded MX icon instead of resolving the theme icon
+  renders the embedded lime keyboard icon instead of resolving the theme icon
   `input-keyboard`.
 - If a nested environment cannot provide an SNI-capable panel, do not weaken
   the check or use the working desktop as a fallback; repeat it in a disposable
@@ -96,7 +96,7 @@ Run these checks with the default `tray` feature enabled:
 
 - Build the native MSVC release executable and launch it from Explorer or
   `Start-Process`. Confirm no console window appears.
-- Confirm Explorer shows the unique MX icon for
+- Confirm Explorer shows the unique lime keyboard icon for
   `mx-keyboard-switcher.exe`, and that the tray shows the same recognizable
   icon rather than a generic application icon.
 - Run the common tray checks above, including checkmarks, both dynamic key
@@ -124,8 +124,8 @@ Run these checks with the default `tray` feature enabled:
 
 - Launch the release binary and confirm it creates no ordinary window and no
   Dock icon.
-- Confirm the MX template icon remains recognizable in both light and dark
-  menu-bar appearances; it must not depend on its indigo/lime RGB colors to be
+- Confirm the keyboard icon remains recognizable in both light and dark
+  menu-bar appearances; it must not depend on its lime RGB colors to be
   legible.
 - Run the common tray checks above and confirm the menu states and dynamic
   labels match the Linux/Windows behavior. **Quit** must remove the menu-bar
