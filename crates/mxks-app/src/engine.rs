@@ -22,6 +22,25 @@ use crate::usage_io::UsageStore;
 /// cannot type a whole word this fast; a leaked echo replays instantly.
 const AUTOCORRECT_COOLDOWN: Duration = Duration::from_millis(150);
 
+/// Apps that forward keyboard input to another machine (RDP/VNC clients, VM
+/// consoles, remote-control tools). The typed text lives on the remote side,
+/// whose layout this daemon can neither read nor switch, so any correction
+/// comes out as garbage (an RDP client reinterprets injected Unicode units as
+/// scancodes) — and the remote machine's own switcher is the one responsible
+/// there. Always hard-off, independent of the user's exclusion config.
+const REMOTE_INPUT_HOSTS: &[&str] = &[
+    "mstsc",      // Windows RDP client
+    "vmconnect",  // Hyper-V console
+    "freerdp",    // xfreerdp / wfreerdp
+    "remmina",    // Linux RDP/VNC client
+    "vinagre",    // GNOME VNC client
+    "virtualbox", // VirtualBoxVM
+    "vmware",     // VMware console
+    "rustdesk",
+    "anydesk",
+    "parsec",
+];
+
 /// Commands sent from the tray (or other UI) to the engine.
 // Some variants are only constructed by the tray, which is compiled out on
 // platforms/builds without it.
@@ -750,6 +769,10 @@ impl Engine {
             list.iter()
                 .any(|e| !e.is_empty() && app.contains(&e.to_lowercase()))
         };
+        // Input aimed at another machine cannot be corrected from this one.
+        if REMOTE_INPUT_HOSTS.iter().any(|host| app.contains(host)) {
+            return (AppMode::Off, false);
+        }
         // Hard exclusion (Off) wins over everything.
         if matches(&ex.apps) {
             (AppMode::Off, false)
@@ -1132,6 +1155,66 @@ mod tests {
         key_tx.send(space()).unwrap();
         drop(key_tx);
         engine.run(key_rx, cmd_rx);
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    /// Converting a single in-progress letter via the hotkey must erase exactly
+    /// one character, retype it, separate it with a space, and toggle cleanly.
+    #[test]
+    fn single_letter_manual_convert_and_toggle() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = bare_engine(log.clone());
+
+        engine.handle_key(letter_shift(PhysKey::V)); // "V" -> should become "М"
+        engine.handle_key(hotkey());
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                Op::Switch(Lang::Ru),
+                Op::Backspaces(1),
+                Op::Type("М".to_string()),
+                Op::Type(" ".to_string()),
+            ]
+        );
+
+        log.lock().unwrap().clear();
+        engine.handle_key(hotkey()); // toggle back: "М " -> "V "
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                Op::Switch(Lang::En),
+                Op::Backspaces(2),
+                Op::Type("V".to_string()),
+                Op::Type(" ".to_string()),
+            ]
+        );
+
+        log.lock().unwrap().clear();
+        engine.handle_key(hotkey()); // and forth again: "V " -> "М "
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![
+                Op::Switch(Lang::Ru),
+                Op::Backspaces(2),
+                Op::Type("М".to_string()),
+                Op::Type(" ".to_string()),
+            ]
+        );
+    }
+
+    /// Remote-input hosts (RDP/VNC clients, VM consoles) are hard-off
+    /// regardless of the user's exclusion config: the text lives on the other
+    /// machine, whose layout this daemon cannot see or switch.
+    #[test]
+    fn remote_input_host_disables_everything() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _hk_ctrl) = mode_engine(Config::default(), "mstsc.exe", log.clone());
+
+        for ev in ghbdtn() {
+            engine.handle_key(ev);
+        }
+        engine.handle_key(space()); // no autocorrect
+        engine.handle_key(hotkey()); // and no manual conversion either
         assert!(log.lock().unwrap().is_empty());
     }
 
