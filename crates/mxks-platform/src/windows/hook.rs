@@ -16,8 +16,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
+    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 use super::keymap;
@@ -164,11 +164,19 @@ fn classify(shared: &Shared, kb: &KBDLLHOOKSTRUCT, m: &Mods) -> Option<KeyKind> 
     Some(KeyKind::Reset)
 }
 
+/// `dwExtraInfo` is the precise marker for our own `SendInput` calls, but some
+/// Windows/application paths do not preserve it. `LLKHF_INJECTED` is set by the
+/// OS for every synthetic keyboard event and is the authoritative fallback.
+fn is_injected(kb: &KBDLLHOOKSTRUCT) -> bool {
+    kb.dwExtraInfo == MAGIC || kb.flags.contains(LLKHF_INJECTED)
+}
+
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        // Ignore our own injected events.
-        if kb.dwExtraInfo != MAGIC {
+        // Never feed synthetic input back into the word buffer. Prefer our
+        // MAGIC tag, with the OS-injected flag as a required fallback.
+        if !is_injected(kb) {
             let msg = wparam.0 as u32;
             if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
                 if let Some(shared) = SHARED.get() {
@@ -236,5 +244,35 @@ impl crate::KeyCapture for WinCapture {
             let _ = UnhookWindowsHookEx(hook);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injected_flag_suppresses_event_when_extra_info_is_lost() {
+        let kb = KBDLLHOOKSTRUCT {
+            flags: LLKHF_INJECTED,
+            ..Default::default()
+        };
+
+        assert!(is_injected(&kb));
+    }
+
+    #[test]
+    fn magic_tag_suppresses_event_without_injected_flag() {
+        let kb = KBDLLHOOKSTRUCT {
+            dwExtraInfo: MAGIC,
+            ..Default::default()
+        };
+
+        assert!(is_injected(&kb));
+    }
+
+    #[test]
+    fn physical_event_is_not_suppressed() {
+        assert!(!is_injected(&KBDLLHOOKSTRUCT::default()));
     }
 }
