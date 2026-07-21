@@ -60,6 +60,14 @@ pub fn phys_of(scan: u32) -> Option<PhysKey> {
     LETTERS.iter().find(|(s, _)| *s == scan).map(|(_, k)| *k)
 }
 
+/// Windows set-1 scan code for a tracked physical key.
+pub fn scan_of(key: PhysKey) -> Option<u16> {
+    LETTERS
+        .iter()
+        .find(|(_, candidate)| *candidate == key)
+        .map(|(scan, _)| *scan as u16)
+}
+
 pub fn is_boundary(scan: u32) -> bool {
     BOUNDARIES.contains(&scan)
 }
@@ -110,4 +118,17 @@ pub fn vk_name(vk: u16) -> Option<String> {
         _ => return None,
     };
     Some(named.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_lookup_is_inverse_of_physical_lookup() {
+        for key in PhysKey::ALL {
+            let scan = scan_of(key).expect("every tracked physical key has a Windows scan");
+            assert_eq!(phys_of(u32::from(scan)), Some(key));
+        }
+    }
 }
