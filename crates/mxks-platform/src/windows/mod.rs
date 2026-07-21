@@ -16,7 +16,9 @@ use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, HKL};
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+};
 
 use crate::{Backend, FocusInfo};
 
@@ -24,21 +26,43 @@ use crate::{Backend, FocusInfo};
 pub const MAGIC: usize = 0x4B42_5357; // "KBSW"
 
 pub(super) struct ForegroundKeyboard {
-    pub hwnd: HWND,
+    /// Top-level foreground window, retained to detect focus changes while a
+    /// layout request is in flight.
+    pub foreground_hwnd: HWND,
+    /// Actual focused control that owns keyboard input and receives
+    /// `WM_INPUTLANGCHANGEREQUEST`.
+    pub target_hwnd: HWND,
     pub thread_id: u32,
     pub hkl: HKL,
 }
 
 pub(super) fn foreground_keyboard() -> Result<ForegroundKeyboard> {
     unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
+        let foreground_hwnd = GetForegroundWindow();
+        if foreground_hwnd.is_invalid() {
             anyhow::bail!("no foreground window");
         }
 
-        let thread_id = GetWindowThreadProcessId(hwnd, None);
-        if thread_id == 0 {
+        let foreground_thread_id = GetWindowThreadProcessId(foreground_hwnd, None);
+        if foreground_thread_id == 0 {
             anyhow::bail!("foreground window has no thread");
+        }
+
+        let mut gui = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let target_hwnd = if GetGUIThreadInfo(foreground_thread_id, &mut gui).is_ok()
+            && !gui.hwndFocus.is_invalid()
+        {
+            gui.hwndFocus
+        } else {
+            foreground_hwnd
+        };
+
+        let thread_id = GetWindowThreadProcessId(target_hwnd, None);
+        if thread_id == 0 {
+            anyhow::bail!("focused window has no thread");
         }
 
         let hkl = GetKeyboardLayout(thread_id);
@@ -47,7 +71,8 @@ pub(super) fn foreground_keyboard() -> Result<ForegroundKeyboard> {
         }
 
         Ok(ForegroundKeyboard {
-            hwnd,
+            foreground_hwnd,
+            target_hwnd,
             thread_id,
             hkl,
         })

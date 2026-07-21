@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use mxks_core::layout::Lang;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -11,15 +11,45 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KLF_SUBSTITUTE_OK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, WM_INPUTLANGCHANGEREQUEST,
+    GetForegroundWindow, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
 };
 
 const LANGID_EN: u16 = 0x0409;
 const LANGID_RU: u16 = 0x0419;
-const SWITCH_TIMEOUT: Duration = Duration::from_millis(10);
+const SWITCH_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 pub struct WinLayout;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationPollFailure {
+    ForegroundChanged,
+    Exhausted,
+}
+
+/// Poll layout activation through injectable observations and waiting. Keeping
+/// the decision loop independent of Win32 and wall-clock time makes delayed
+/// message processing and focus races deterministic in tests.
+fn poll_until_active(
+    target_langid: u16,
+    mut observe: impl FnMut() -> (bool, u16),
+    mut elapsed: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+) -> std::result::Result<(), ActivationPollFailure> {
+    loop {
+        let (foreground_stable, current_langid) = observe();
+        if !foreground_stable {
+            return Err(ActivationPollFailure::ForegroundChanged);
+        }
+        if current_langid == target_langid {
+            return Ok(());
+        }
+        if elapsed() >= SWITCH_TIMEOUT {
+            return Err(ActivationPollFailure::Exhausted);
+        }
+        sleep(POLL_INTERVAL);
+    }
+}
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -60,38 +90,101 @@ impl crate::LayoutSwitcher for WinLayout {
             bail!("loaded keyboard layout has unexpected language");
         }
 
-        let message_result = unsafe {
-            SendMessageTimeoutW(
-                keyboard.hwnd,
+        unsafe {
+            PostMessageW(
+                Some(keyboard.target_hwnd),
                 WM_INPUTLANGCHANGEREQUEST,
                 WPARAM(0),
                 LPARAM(hkl.0 as isize),
-                SMTO_ABORTIFHUNG,
-                25,
-                None,
             )
-        };
-        if message_result.0 == 0 {
-            bail!("foreground window rejected or timed out changing keyboard layout");
         }
+        .context("could not queue keyboard layout change for focused window")?;
 
-        let deadline = Instant::now() + SWITCH_TIMEOUT;
-        loop {
-            if unsafe { GetForegroundWindow() } != keyboard.hwnd {
-                bail!("foreground window changed while activating keyboard layout");
+        let started = Instant::now();
+        let result = poll_until_active(
+            target_langid,
+            || {
+                let foreground_stable =
+                    unsafe { GetForegroundWindow() } == keyboard.foreground_hwnd;
+                let current = unsafe { GetKeyboardLayout(keyboard.thread_id) };
+                (foreground_stable, langid(current))
+            },
+            || started.elapsed(),
+            std::thread::sleep,
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(ActivationPollFailure::ForegroundChanged) => {
+                bail!("foreground window changed while activating keyboard layout")
             }
-            let current = unsafe { GetKeyboardLayout(keyboard.thread_id) };
-            if langid(current) == target_langid {
-                return Ok(());
+            Err(ActivationPollFailure::Exhausted) => {
+                bail!("target keyboard layout did not activate before deadline")
             }
-            if Instant::now() >= deadline {
-                bail!("target keyboard layout did not activate before deadline");
-            }
-            std::thread::sleep(POLL_INTERVAL);
         }
     }
 }
 
 fn langid(hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL) -> u16 {
     (hkl.0 as usize & 0xFFFF) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn delayed_activation_after_many_polls_succeeds() {
+        let mut polls = 0;
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = poll_until_active(
+            LANGID_RU,
+            || {
+                polls += 1;
+                let current = if polls >= 26 { LANGID_RU } else { LANGID_EN };
+                (true, current)
+            },
+            || elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+
+        assert_eq!(result, Ok(()));
+        assert!(polls >= 25);
+    }
+
+    #[test]
+    fn foreground_change_fails_polling() {
+        let mut polls = 0;
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = poll_until_active(
+            LANGID_RU,
+            || {
+                polls += 1;
+                (polls < 4, LANGID_EN)
+            },
+            || elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+
+        assert_eq!(result, Err(ActivationPollFailure::ForegroundChanged));
+        assert_eq!(polls, 4);
+    }
+
+    #[test]
+    fn exhausted_polling_fails() {
+        let mut polls = 0;
+        let elapsed = Cell::new(Duration::ZERO);
+        let result = poll_until_active(
+            LANGID_RU,
+            || {
+                polls += 1;
+                (true, LANGID_EN)
+            },
+            || elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+
+        assert_eq!(result, Err(ActivationPollFailure::Exhausted));
+        assert!(polls > 25);
+    }
 }
