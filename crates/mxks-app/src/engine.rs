@@ -263,7 +263,7 @@ impl Engine {
                 if let Err(e) = crate::config_io::save_hotkey(&shown) {
                     tracing::warn!("could not save hotkey: {e:#}");
                 }
-                tracing::info!("conversion hotkey set to {shown}");
+                tracing::info!("conversion hotkey updated");
             }
             CaptureTarget::AcceptKey => {
                 self.config.autocomplete.accept_key = shown.clone();
@@ -275,7 +275,7 @@ impl Engine {
                 if let Err(e) = crate::config_io::save_accept_key(&shown) {
                     tracing::warn!("could not save accept key: {e:#}");
                 }
-                tracing::info!("autocomplete accept key set to {shown}");
+                tracing::info!("autocomplete accept key updated");
             }
         }
         self.broadcast_status();
@@ -545,18 +545,7 @@ impl Engine {
             let params = self.params();
             analyze(&word, &params)
         };
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let typed = mxks_core::convert::render_keys(&word.keys, word.lang);
-            let converted = mxks_core::convert::render_keys(&word.keys, word.lang.other());
-            tracing::debug!(
-                "word: active={:?} typed={:?} converted={:?} verdict={:?}",
-                word.lang,
-                typed,
-                converted,
-                verdict
-            );
-        }
-        if let Verdict::Correct(conv) = verdict {
+        if let Verdict::Correct(_) = verdict {
             let to = word.lang.other();
             match self
                 .corrector
@@ -566,7 +555,7 @@ impl Engine {
                     self.active = to;
                     self.last = None;
                     self.last_correction = Some(Instant::now());
-                    tracing::debug!("corrected -> {conv}");
+                    tracing::debug!("autocorrect completed");
                 }
                 Err(e) => tracing::warn!("autocorrect failed: {e:#}"),
             }
@@ -583,9 +572,21 @@ impl Engine {
         // The hotkey is on-demand, so it works everywhere except hard-off apps
         // (password managers). It intentionally still works in manual-only apps
         // like terminals.
-        if self.app_mode() == AppMode::Off {
+        let focused_app = self.focus.focused_app();
+        if self.classify_focus(&focused_app).0 == AppMode::Off {
             return;
         }
+
+        let current = self.buffer.current();
+        tracing::info!(
+            app = focused_app.as_deref().unwrap_or("<unknown>"),
+            active_lang = ?self.active,
+            buffer_lang = ?current.as_ref().map(|word| word.lang),
+            buffer_stroke_count = current.as_ref().map_or(0, |word| word.keys.len()),
+            has_last = self.last.is_some(),
+            has_toggle = self.toggle.is_some(),
+            "conversion hotkey accepted"
+        );
 
         // Toggle the previous manual conversion back and forth.
         if let Some(t) = self.toggle.take() {

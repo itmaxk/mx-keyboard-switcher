@@ -2,10 +2,14 @@
 //! layout, retype the text through the target layout. Owns the injector and
 //! layout switcher.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::Result;
 use mxks_core::convert::{render_keys, Stroke};
 use mxks_core::layout::Lang;
 use mxks_platform::{KeyInjector, LayoutSwitcher};
+
+static NEXT_CONVERSION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Corrector {
     injector: Box<dyn KeyInjector>,
@@ -33,22 +37,104 @@ impl Corrector {
         existing_trailing: &str,
         replacement_trailing: &str,
     ) -> Result<()> {
-        let current = self.layout.current()?;
+        let transaction_id = NEXT_CONVERSION_ID.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            transaction_id,
+            from = ?from,
+            to = ?to,
+            stroke_count = keys.len(),
+            existing_trailing_chars = existing_trailing.chars().count(),
+            replacement_trailing_chars = replacement_trailing.chars().count(),
+            "conversion begin"
+        );
+
+        let current = match self.layout.current() {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::error!(
+                    transaction_id,
+                    stage = "read_source_layout",
+                    error = %format_args!("{error:#}"),
+                    "conversion failed"
+                );
+                return Err(error);
+            }
+        };
         if current != Some(from) {
-            anyhow::bail!(
+            let error = anyhow::anyhow!(
                 "source layout changed before correction: expected {from:?}, got {current:?}"
             );
+            tracing::error!(
+                transaction_id,
+                stage = "verify_source_layout",
+                actual = ?current,
+                error = %error,
+                "conversion failed"
+            );
+            return Err(error);
         }
-        self.layout.switch_to(to)?;
-        let current = self.layout.current()?;
+        if let Err(error) = self.layout.switch_to(to) {
+            tracing::error!(
+                transaction_id,
+                stage = "switch_layout",
+                error = %format_args!("{error:#}"),
+                "conversion failed"
+            );
+            return Err(error);
+        }
+        let current = match self.layout.current() {
+            Ok(current) => current,
+            Err(error) => {
+                tracing::error!(
+                    transaction_id,
+                    stage = "read_target_layout",
+                    error = %format_args!("{error:#}"),
+                    "conversion failed"
+                );
+                return Err(error);
+            }
+        };
         if current != Some(to) {
-            anyhow::bail!("target layout did not activate: expected {to:?}, got {current:?}");
+            let error =
+                anyhow::anyhow!("target layout did not activate: expected {to:?}, got {current:?}");
+            tracing::error!(
+                transaction_id,
+                stage = "verify_target_layout",
+                actual = ?current,
+                error = %error,
+                "conversion failed"
+            );
+            return Err(error);
         }
         let rendered = render_keys(keys, from);
         let erase = rendered.chars().count() + existing_trailing.chars().count();
         let text = render_keys(keys, to);
-        self.injector
+        tracing::info!(
+            transaction_id,
+            verified_layout = ?to,
+            erase_chars = erase,
+            replacement_chars = text.chars().count(),
+            replacement_trailing_chars = replacement_trailing.chars().count(),
+            "conversion layout verified; injecting"
+        );
+        match self
+            .injector
             .replace_text(erase, &text, replacement_trailing)
+        {
+            Ok(()) => {
+                tracing::info!(transaction_id, "conversion succeeded");
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    transaction_id,
+                    stage = "replace_text",
+                    error = %format_args!("{error:#}"),
+                    "conversion failed"
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Read the current system layout, if it is EN or RU.

@@ -74,7 +74,7 @@ fn run() -> Result<()> {
     let config = config_io::load();
 
     let spec = hotkey::parse(&config.hotkeys.convert_last_word).unwrap_or_default();
-    tracing::info!("convert hotkey: {:?}", spec);
+    tracing::info!("conversion hotkey configured");
 
     let mut backend = mxks_platform::backend(spec).context("initializing platform backend")?;
 
@@ -106,10 +106,7 @@ fn run() -> Result<()> {
     // Seed the accept-key spec from config before it moves into the engine.
     match hotkey::parse(&config.autocomplete.accept_key) {
         Some(accept) => backend.intercept.set_spec(accept),
-        None => tracing::warn!(
-            "invalid autocomplete accept_key {:?}; keeping default Tab",
-            config.autocomplete.accept_key
-        ),
+        None => tracing::warn!("invalid autocomplete accept key; keeping the platform default"),
     }
 
     let corrector = Corrector::new(backend.injector, backend.layout);
@@ -209,9 +206,52 @@ impl mxks_platform::KeyCapture for NoopCapture {
 }
 
 fn init_logging() {
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
     use tracing_subscriber::{fmt, EnvFilter};
+
     let filter = EnvFilter::try_from_env("MXKS_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    let requested_path = config_io::log_path().ok();
+
+    match config_io::open_log_file() {
+        Ok((path, file)) => {
+            fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::io::stderr.and(Mutex::new(file)))
+                .init();
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                os = std::env::consts::OS,
+                log_path = %path.display(),
+                "startup"
+            );
+        }
+        Err(error) => {
+            fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::io::stderr)
+                .init();
+            let path = requested_path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unavailable>".to_string());
+            tracing::warn!(
+                log_path = %path,
+                error = %format_args!("{error:#}"),
+                "file logging unavailable; continuing with stderr"
+            );
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                os = std::env::consts::OS,
+                log_path = %path,
+                "startup"
+            );
+        }
+    }
 }
 
 /// Open a file with the OS default handler.

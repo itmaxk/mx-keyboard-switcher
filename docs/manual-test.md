@@ -11,6 +11,20 @@ pipeline. These manual steps verify end-to-end behaviour in real apps on each OS
    desktop display.
 3. Open a plain text field (text editor, browser address bar, chat box).
 
+## Diagnostic log
+
+Every build writes an operational log to `mxks.log` in the same
+`mx-keyboard-switcher` configuration directory as `config.toml`:
+
+- Windows: `%APPDATA%\mx-keyboard-switcher\mxks.log`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/mx-keyboard-switcher/mxks.log`
+- macOS: `~/Library/Application Support/mx-keyboard-switcher/mxks.log`
+
+The log records startup, accepted conversion hotkeys, layout states, buffer
+lengths, and correlated conversion transaction results. It does not record
+typed letters or rendered word contents. The current file is appended across
+starts and rotated to `mxks.log.1` after it exceeds 4 MiB.
+
 ## Core scenarios (run on every OS)
 
 | # | Steps | Expected |
