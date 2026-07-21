@@ -38,13 +38,16 @@ impl Corrector {
         replacement_trailing: &str,
     ) -> Result<()> {
         let transaction_id = NEXT_CONVERSION_ID.fetch_add(1, Ordering::Relaxed);
+        let source_text = render_keys(keys, from);
+        let replacement_text = render_keys(keys, to);
         tracing::info!(
             transaction_id,
             from = ?from,
             to = ?to,
-            stroke_count = keys.len(),
-            existing_trailing_chars = existing_trailing.chars().count(),
-            replacement_trailing_chars = replacement_trailing.chars().count(),
+            source_text = %source_text,
+            replacement_text = %replacement_text,
+            existing_trailing = %existing_trailing,
+            replacement_trailing = %replacement_trailing,
             "conversion begin"
         );
 
@@ -106,23 +109,27 @@ impl Corrector {
             );
             return Err(error);
         }
-        let rendered = render_keys(keys, from);
-        let erase = rendered.chars().count() + existing_trailing.chars().count();
-        let text = render_keys(keys, to);
+        let erase = source_text.chars().count() + existing_trailing.chars().count();
         tracing::info!(
             transaction_id,
             verified_layout = ?to,
             erase_chars = erase,
-            replacement_chars = text.chars().count(),
-            replacement_trailing_chars = replacement_trailing.chars().count(),
+            replacement_chars = replacement_text.chars().count(),
+            replacement_text = %replacement_text,
+            replacement_trailing = %replacement_trailing,
             "conversion layout verified; injecting"
         );
         match self
             .injector
-            .replace_text(erase, &text, replacement_trailing)
+            .replace_text(erase, &replacement_text, replacement_trailing)
         {
             Ok(()) => {
-                tracing::info!(transaction_id, "conversion succeeded");
+                tracing::info!(
+                    transaction_id,
+                    injected_text = %replacement_text,
+                    injected_trailing = %replacement_trailing,
+                    "conversion succeeded"
+                );
                 Ok(())
             }
             Err(error) => {

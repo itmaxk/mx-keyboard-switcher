@@ -287,6 +287,12 @@ impl Engine {
         }
         // Any real typing invalidates the manual-conversion toggle.
         if !matches!(ev.kind, KeyKind::Hotkey) {
+            if self.toggle.is_some() {
+                tracing::info!(
+                    event_kind = ?ev.kind,
+                    "conversion toggle invalidated by input event"
+                );
+            }
             self.toggle = None;
         }
         match ev.kind {

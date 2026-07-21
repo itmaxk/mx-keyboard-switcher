@@ -21,9 +21,10 @@ Every build writes an operational log to `mxks.log` in the same
 - macOS: `~/Library/Application Support/mx-keyboard-switcher/mxks.log`
 
 The log records startup, accepted conversion hotkeys, layout states, buffer
-lengths, and correlated conversion transaction results. It does not record
-typed letters or rendered word contents. The current file is appended across
-starts and rotated to `mxks.log.1` after it exceeds 4 MiB.
+lengths, toggle invalidations, and each conversion's source, intended
+replacement, and injected text. It therefore contains words handled by MXKS;
+treat it as sensitive and inspect it before sharing. The current file is
+appended across starts and rotated to `mxks.log.1` after it exceeds 4 MiB.
 
 ## Core scenarios (run on every OS)
 
