@@ -174,6 +174,34 @@ mod tests {
         }
     }
 
+    fn assert_replacement(inputs: &[INPUT], erase: usize, replacement: &str) {
+        let delete_events = erase * 2;
+        assert_eq!(
+            inputs.len(),
+            delete_events + replacement.encode_utf16().count() * 2
+        );
+        assert_tagged(inputs);
+
+        for pair in inputs[..delete_events].chunks_exact(2) {
+            let down = keyboard(&pair[0]);
+            let up = keyboard(&pair[1]);
+            assert_eq!(down.wVk, VK_BACK);
+            assert_eq!(up.wVk, VK_BACK);
+            assert_eq!(down.wScan, 0);
+            assert_eq!(up.wScan, 0);
+            assert_eq!(down.dwFlags, KEYBD_EVENT_FLAGS(0));
+            assert_eq!(up.dwFlags, KEYEVENTF_KEYUP);
+        }
+
+        let unicode = &inputs[delete_events..];
+        assert_unicode_pairs(unicode);
+        let actual_units: Vec<_> = unicode
+            .chunks_exact(2)
+            .map(|pair| keyboard(&pair[0]).wScan)
+            .collect();
+        assert_eq!(actual_units, replacement.encode_utf16().collect::<Vec<_>>());
+    }
+
     #[test]
     fn russian_word_uses_one_unicode_pair_per_letter() {
         let inputs = text_inputs("капельки");
@@ -203,17 +231,14 @@ mod tests {
 
     #[test]
     fn replacement_is_one_tagged_batch() {
-        let inputs = replacement_inputs(9, "капельки", " ");
-        assert_eq!(inputs.len(), 36);
-        assert_tagged(&inputs);
-        for pair in inputs[..18].chunks_exact(2) {
-            assert_eq!(keyboard(&pair[0]).wVk, VK_BACK);
-            assert_eq!(keyboard(&pair[1]).wVk, VK_BACK);
-            assert_eq!(
-                keyboard(&pair[1]).dwFlags,
-                keyboard(&pair[0]).dwFlags | KEYEVENTF_KEYUP
-            );
-        }
-        assert_unicode_pairs(&inputs[18..]);
+        // First hotkey press: erase `how`, then type `рщц ` in one SendInput
+        // transaction (three Delete pairs, four Unicode pairs).
+        let to_russian = replacement_inputs(3, "рщц", " ");
+        assert_replacement(&to_russian, 3, "рщц ");
+
+        // Toggle back: erase `рщц `, then type `how ` in one SendInput
+        // transaction (four Delete pairs, four Unicode pairs).
+        let to_english = replacement_inputs(4, "how", " ");
+        assert_replacement(&to_english, 4, "how ");
     }
 }

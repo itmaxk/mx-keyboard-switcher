@@ -319,6 +319,121 @@ fn injected_input_is_suppressed() {
     );
 }
 
+/// When the physical Space that completed a word is still held, correction
+/// must release that held state before replaying its trailing Space. Otherwise
+/// XTEST treats the injected press as an already-down key and the application
+/// receives no replacement separator.
+#[test]
+#[ignore = "requires a live X server with ru/us layouts"]
+fn held_space_boundary_is_replayed_once() {
+    require_isolated_display();
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{
+        ConnectionExt as _, CreateWindowAux, EventMask, InputFocus, WindowClass,
+    };
+    use x11rb::protocol::Event;
+    use x11rb::rust_connection::RustConnection;
+    use x11rb::{COPY_FROM_PARENT, CURRENT_TIME};
+
+    let Backend {
+        mut injector,
+        mut layout,
+        ..
+    } = backend(HotkeySpec::default()).expect("backend");
+
+    // A focused event sink gives us the exact key-press stream received by an
+    // application, independent of the daemon's RECORD suppression path.
+    let (sink, screen) = RustConnection::connect(None).expect("sink conn");
+    let root = sink.setup().roots[screen].root;
+    let window = sink.generate_id().expect("window id");
+    sink.create_window(
+        COPY_FROM_PARENT as u8,
+        window,
+        root,
+        0,
+        0,
+        100,
+        100,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new().event_mask(EventMask::KEY_PRESS),
+    )
+    .expect("create sink");
+    sink.map_window(window).expect("map sink");
+    sink.set_input_focus(InputFocus::PARENT, window, CURRENT_TIME)
+        .expect("focus sink");
+    sink.flush().expect("flush sink setup");
+    assert_eq!(
+        sink.get_input_focus().unwrap().reply().unwrap().focus,
+        window,
+        "event sink did not receive input focus"
+    );
+
+    let space = keycode_of(0x20);
+    let backspace = keycode_of(0xff08);
+    let letters = [
+        keycode_of(0x67), // G -> п
+        keycode_of(0x68), // H -> р
+        keycode_of(0x62), // B -> и
+        keycode_of(0x64), // D -> в
+        keycode_of(0x74), // T -> е
+        keycode_of(0x6e), // N -> т
+    ];
+
+    layout.switch_to(Lang::En).expect("switch en");
+    raw_key(space, true); // the real boundary press remains physically held
+    layout.switch_to(Lang::Ru).expect("switch ru");
+    injector
+        .replace_text(7, "привет", " ")
+        .expect("replace_text");
+    raw_key(space, false); // the user's eventual release
+
+    let expected_len = 1 + 7 + letters.len() + 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut presses = Vec::new();
+    while presses.len() < expected_len && std::time::Instant::now() < deadline {
+        while let Some(event) = sink.poll_for_event().expect("poll sink") {
+            if let Event::KeyPress(event) = event {
+                presses.push(event.detail);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut expected = vec![space];
+    expected.extend(std::iter::repeat_n(backspace, 7));
+    expected.extend(letters);
+    expected.push(space);
+    assert_eq!(presses, expected, "unexpected focused key-press sequence");
+    assert_eq!(
+        presses[8..].iter().filter(|&&kc| kc == space).count(),
+        1,
+        "replacement must contain exactly one trailing Space press"
+    );
+
+    // Replay the observed application input over the already-visible source
+    // word. The initial held Space completes `ghbdtn`; seven Backspaces erase
+    // it and its boundary, then the six target letters plus one Space remain.
+    let mut model: Vec<char> = "ghbdtn".chars().collect();
+    for keycode in presses {
+        if keycode == backspace {
+            model.pop();
+        } else if keycode == space {
+            model.push(' ');
+        } else {
+            let index = letters
+                .iter()
+                .position(|&letter| letter == keycode)
+                .expect("unexpected letter keycode");
+            model.push("привет".chars().nth(index).unwrap());
+        }
+    }
+    assert_eq!(model.into_iter().collect::<String>(), "привет ");
+
+    layout.switch_to(Lang::En).ok();
+}
+
 /// Validate the accept-key **grab strategy** directly against the X server:
 /// grabbing the accept key with its base modifier mask plus the CapsLock/NumLock
 /// lock variants (never `AnyModifier`) must catch a bare accept-key press yet

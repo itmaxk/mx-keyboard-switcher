@@ -19,7 +19,7 @@ pipeline. These manual steps verify end-to-end behaviour in real apps on each OS
 | 2 | With **RU** active, type `руддщ` then Space | Becomes `hello `, layout switches to EN |
 | 3 | Type a valid word `hello` then Space | Left unchanged |
 | 4 | Type a valid word `привет` (RU) then Space | Left unchanged |
-| 5 | Type `ghbdtn`, then press the hotkey (Pause) before Space | Converts to `привет`, layout switches |
+| 5 | Type `ghbdtn`, then press the hotkey (Pause) before Space | Converts to `привет `, layout switches |
 | 6 | Type a password-like `qwerty123` then Space | Left unchanged (has digits) |
 | 7 | Tray → toggle **Autocorrection** off, repeat #1 | No correction happens |
 | 8 | Tray → toggle **Enabled** off, repeat #1 and #5 | Nothing happens |
@@ -29,6 +29,7 @@ pipeline. These manual steps verify end-to-end behaviour in real apps on each OS
 | 12 | Type the shown `готово` completion manually, then press the accept key | Overlay shows `[Tab: confirm]`; confirmation does not change text and stores exactly one new accept |
 | 13 | Type `ghb` in an editor, click into a browser text field, type `ghbdtn` then Space | Exactly `привет ` appears — no doubled or leftover characters; the editor's `ghb` is forgotten (the hotkey converts nothing) |
 | 14 | Repeat #13 but switch windows with Alt+Tab instead of clicking | Same: exactly `привет `, first correction in the new window is clean |
+| 15 | With **EN** active, type `how`, then press the conversion hotkey twice | First becomes exactly `рщц ` with RU active; second becomes exactly `how ` with EN active |
 
 ## Tray and icon (run on every OS)
 
@@ -62,6 +63,9 @@ Run these checks with the default `tray` feature enabled:
 - Verify in: a terminal, a GTK app (gedit/text editor), Firefox/Chromium.
 - Confirm no infinite loop / echo (scenario #9): our injected events must not be
   re-captured.
+- In GTK editor, Firefox, and Chromium, repeat scenarios #1 and #15 twenty
+  times in a disposable X11 VM or isolated Xephyr/Xvfb session. Expect exactly
+  one trailing Space and no echo, doubling, or dropped characters.
 - On a Wayland session, confirm the startup warning appears and native Wayland
   apps are not captured (XWayland apps may be).
 
@@ -90,6 +94,12 @@ Run these checks with the default `tray` feature enabled:
 - Verify in: Notepad, a browser, an RDP/remote session note.
 - Confirm antivirus does not block the low-level hook (whitelist if needed).
 - Confirm injected events aren't re-captured (dwExtraInfo tag works).
+- In Chrome and Edge, open
+  `data:text/html,<textarea autofocus style="width:80vw;height:40vh"></textarea>`.
+  Repeat scenario #15 twenty times both without pauses and while holding the
+  hotkey through autorepeat. Every cycle must end as exact `how `: no `hhooww`,
+  missing characters, or second Space. Repeat scenario #1, then scenario #15 in
+  Notepad.
 
 
 ### Windows tray and executable
@@ -119,6 +129,9 @@ Run these checks with the default `tray` feature enabled:
 - Confirm a focused **password field** is not corrected (Secure Input blinds the
   tap automatically).
 - Verify in: TextEdit, a browser, Notes.
+- In TextEdit and a browser text field, repeat scenarios #1 and #15 twenty
+  times. Expect one trailing Space, stable `how ` after the double toggle, and
+  the system layout matching the resulting text after each step.
 
 ### macOS menu-bar UX
 

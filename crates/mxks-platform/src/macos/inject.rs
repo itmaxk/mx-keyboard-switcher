@@ -36,18 +36,42 @@ impl MacInjector {
     fn tag(event: &CGEvent) {
         event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, MAGIC);
     }
+
+    fn keyboard_event(source: &CGEventSource, keycode: u16, down: bool) -> Result<CGEvent> {
+        let event = CGEvent::new_keyboard_event(source.clone(), keycode, down)
+            .map_err(|_| anyhow!("failed to create keyboard event"))?;
+        Self::tag(&event);
+        Ok(event)
+    }
+
+    fn unicode_event(source: &CGEventSource, utf16: &[u16], down: bool) -> Result<CGEvent> {
+        let event = Self::keyboard_event(source, 0, down)?;
+        event.set_string_from_utf16_unchecked(utf16);
+        Ok(event)
+    }
+
+    fn post_key(source: &CGEventSource, keycode: u16) -> Result<()> {
+        for down in [true, false] {
+            Self::keyboard_event(source, keycode, down)?.post(CGEventTapLocation::HID);
+        }
+        Ok(())
+    }
+
+    fn post_unicode(source: &CGEventSource, ch: char) -> Result<()> {
+        let mut units = [0; 2];
+        let utf16 = ch.encode_utf16(&mut units);
+        for down in [true, false] {
+            Self::unicode_event(source, utf16, down)?.post(CGEventTapLocation::HID);
+        }
+        Ok(())
+    }
 }
 
 impl crate::KeyInjector for MacInjector {
     fn backspaces(&mut self, n: usize) -> Result<()> {
         let source = Self::source()?;
         for _ in 0..n {
-            for down in [true, false] {
-                let event = CGEvent::new_keyboard_event(source.clone(), KEYCODE_DELETE, down)
-                    .map_err(|_| anyhow!("failed to create keyboard event"))?;
-                Self::tag(&event);
-                event.post(CGEventTapLocation::HID);
-            }
+            Self::post_key(&source, KEYCODE_DELETE)?;
         }
         Ok(())
     }
@@ -55,26 +79,24 @@ impl crate::KeyInjector for MacInjector {
     fn type_text(&mut self, text: &str) -> Result<()> {
         let source = Self::source()?;
         for ch in text.chars() {
-            let utf16: Vec<u16> = ch.to_string().encode_utf16().collect();
-            for down in [true, false] {
-                let event = CGEvent::new_keyboard_event(source.clone(), 0, down)
-                    .map_err(|_| anyhow!("failed to create keyboard event"))?;
-                event.set_string_from_utf16_unchecked(&utf16);
-                Self::tag(&event);
-                event.post(CGEventTapLocation::HID);
-            }
+            Self::post_unicode(&source, ch)?;
+        }
+        Ok(())
+    }
+
+    fn replace_text(&mut self, erase: usize, text: &str, trailing: &str) -> Result<()> {
+        let source = Self::source()?;
+        for _ in 0..erase {
+            Self::post_key(&source, KEYCODE_DELETE)?;
+        }
+        for ch in text.chars().chain(trailing.chars()) {
+            Self::post_unicode(&source, ch)?;
         }
         Ok(())
     }
 
     fn tab(&mut self) -> Result<()> {
         let source = Self::source()?;
-        for down in [true, false] {
-            let event = CGEvent::new_keyboard_event(source.clone(), KEYCODE_TAB, down)
-                .map_err(|_| anyhow!("failed to create keyboard event"))?;
-            Self::tag(&event);
-            event.post(CGEventTapLocation::HID);
-        }
-        Ok(())
+        Self::post_key(&source, KEYCODE_TAB)
     }
 }

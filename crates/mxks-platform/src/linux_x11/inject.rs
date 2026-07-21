@@ -101,6 +101,11 @@ impl X11Injector {
     /// Tap the physical key that produces `c` in the currently active group.
     fn tap_char(&self, c: char) -> Result<()> {
         if c == ' ' {
+            // A correction is triggered by a real Space press, so that key may
+            // still be physically held. Release it before the injected tap or
+            // XTEST can treat our press as already down and emit no KeyPress.
+            // This release has no matching press echo to suppress.
+            self.fake_key(false, KC_SPACE)?;
             return self.tap_key(KC_SPACE, false);
         }
         // Determine which layout treats `c` as a letter, then find its key.

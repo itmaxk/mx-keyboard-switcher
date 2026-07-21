@@ -18,13 +18,21 @@ impl Corrector {
     }
 
     /// Re-render `keys` from its current layout `from` into `to`: erase what is
-    /// on screen (the `from` rendering plus `trailing`), switch the system
-    /// layout to `to`, and type the `to` rendering plus `trailing`.
+    /// on screen (the `from` rendering plus `existing_trailing`), switch the
+    /// system layout to `to`, and type the `to` rendering plus
+    /// `replacement_trailing`.
     ///
     /// Erase length is computed from the actual rendered text (not the key
     /// count), so it is correct even when the two layouts render different
     /// character counts.
-    pub fn convert(&mut self, keys: &[Stroke], from: Lang, to: Lang, trailing: &str) -> Result<()> {
+    pub fn convert(
+        &mut self,
+        keys: &[Stroke],
+        from: Lang,
+        to: Lang,
+        existing_trailing: &str,
+        replacement_trailing: &str,
+    ) -> Result<()> {
         let current = self.layout.current()?;
         if current != Some(from) {
             anyhow::bail!(
@@ -37,9 +45,10 @@ impl Corrector {
             anyhow::bail!("target layout did not activate: expected {to:?}, got {current:?}");
         }
         let rendered = render_keys(keys, from);
-        let erase = rendered.chars().count() + trailing.chars().count();
+        let erase = rendered.chars().count() + existing_trailing.chars().count();
         let text = render_keys(keys, to);
-        self.injector.replace_text(erase, &text, trailing)
+        self.injector
+            .replace_text(erase, &text, replacement_trailing)
     }
 
     /// Read the current system layout, if it is EN or RU.
@@ -61,12 +70,6 @@ impl Corrector {
             self.layout.switch_to(lang)?;
         }
         self.injector.type_text(remainder)
-    }
-
-    /// Type a single trailing space (layout-independent) after a manual
-    /// conversion, so the hotkey separates the word without a second keypress.
-    pub fn append_space(&mut self) -> Result<()> {
-        self.injector.type_text(" ")
     }
 
     /// Replay a real Tab keypress (stale-accept fallback: the key was swallowed

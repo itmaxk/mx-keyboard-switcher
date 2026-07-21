@@ -558,7 +558,10 @@ impl Engine {
         }
         if let Verdict::Correct(conv) = verdict {
             let to = word.lang.other();
-            match self.corrector.convert(&word.keys, word.lang, to, &trailing) {
+            match self
+                .corrector
+                .convert(&word.keys, word.lang, to, &trailing, &trailing)
+            {
                 Ok(()) => {
                     self.active = to;
                     self.last = None;
@@ -587,7 +590,10 @@ impl Engine {
         // Toggle the previous manual conversion back and forth.
         if let Some(t) = self.toggle.take() {
             let to = t.lang.other();
-            match self.corrector.convert(&t.keys, t.lang, to, &t.trailing) {
+            match self
+                .corrector
+                .convert(&t.keys, t.lang, to, &t.trailing, &t.trailing)
+            {
                 Ok(()) => {
                     self.active = to;
                     self.last_correction = Some(Instant::now());
@@ -607,37 +613,31 @@ impl Engine {
         }
 
         // First conversion: prefer the in-progress word, else the last completed.
-        // `in_progress` means no separator is on screen yet, so we add a trailing
-        // space ourselves (the word already has its space in the last-completed
-        // case, and convert() re-emits it).
-        let (keys, from, trailing, in_progress) = if let Some(word) = self.buffer.current() {
-            (word.keys, word.lang, String::new(), true)
-        } else if let Some((word, trailing)) = self.last.take() {
-            (word.keys, word.lang, trailing, false)
-        } else {
-            return;
-        };
+        // An in-progress word has no separator on screen yet, but its atomic
+        // replacement includes a trailing space. A last-completed word already
+        // has its separator, so the replacement preserves it.
+        let (keys, from, existing_trailing, replacement_trailing) =
+            if let Some(word) = self.buffer.current() {
+                (word.keys, word.lang, String::new(), " ".to_string())
+            } else if let Some((word, trailing)) = self.last.take() {
+                (word.keys, word.lang, trailing.clone(), trailing)
+            } else {
+                return;
+            };
 
         let to = from.other();
-        match self.corrector.convert(&keys, from, to, &trailing) {
+        match self
+            .corrector
+            .convert(&keys, from, to, &existing_trailing, &replacement_trailing)
+        {
             Ok(()) => {
-                // Convert AND separate the in-progress word with a space, so the
-                // user doesn't have to press Space right after the hotkey.
-                let toggle_trailing = if in_progress {
-                    if let Err(e) = self.corrector.append_space() {
-                        tracing::warn!("append space failed: {e:#}");
-                    }
-                    " ".to_string()
-                } else {
-                    trailing
-                };
                 self.active = to;
                 self.last_correction = Some(Instant::now());
                 self.buffer.clear();
                 self.buffer.set_lang(self.active);
                 self.toggle = Some(Toggle {
                     keys,
-                    trailing: toggle_trailing,
+                    trailing: replacement_trailing,
                     lang: to,
                 });
             }
@@ -834,6 +834,11 @@ mod tests {
         Backspaces(usize),
         Switch(Lang),
         Type(String),
+        Replace {
+            erase: usize,
+            text: String,
+            trailing: String,
+        },
         Tab,
     }
 
@@ -847,6 +852,14 @@ mod tests {
         }
         fn type_text(&mut self, text: &str) -> Result<()> {
             self.0.lock().unwrap().push(Op::Type(text.to_string()));
+            Ok(())
+        }
+        fn replace_text(&mut self, erase: usize, text: &str, trailing: &str) -> Result<()> {
+            self.0.lock().unwrap().push(Op::Replace {
+                erase,
+                text: text.to_string(),
+                trailing: trailing.to_string(),
+            });
             Ok(())
         }
         fn tab(&mut self) -> Result<()> {
@@ -996,8 +1009,8 @@ mod tests {
         }
     }
 
-    /// Typing "ghbdtn " in English must produce the exact correction sequence:
-    /// erase 6 letters + the space, switch to Russian, retype "привет" + " ".
+    /// Typing "ghbdtn " in English must produce one atomic replacement after
+    /// switching to Russian: erase 6 letters + the space and retype "привет ".
     #[test]
     fn autocorrects_wrong_layout_word() {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
@@ -1034,9 +1047,11 @@ mod tests {
             ops,
             vec![
                 Op::Switch(Lang::Ru),
-                Op::Backspaces(7),
-                Op::Type("привет".to_string()),
-                Op::Type(" ".to_string()),
+                Op::Replace {
+                    erase: 7,
+                    text: "привет".to_string(),
+                    trailing: " ".to_string(),
+                },
             ]
         );
     }
@@ -1088,9 +1103,11 @@ mod tests {
             log.lock().unwrap().clone(),
             vec![
                 Op::Switch(Lang::Ru),
-                Op::Backspaces(7),
-                Op::Type("привет".to_string()),
-                Op::Type(" ".to_string()),
+                Op::Replace {
+                    erase: 7,
+                    text: "привет".to_string(),
+                    trailing: " ".to_string(),
+                },
             ]
         );
     }
@@ -1106,7 +1123,7 @@ mod tests {
 
         type_wrong_privet(&mut engine);
         let after_correction = log.lock().unwrap().len();
-        assert_eq!(after_correction, 4); // Switch + Backspaces + Type + Type
+        assert_eq!(after_correction, 2); // Switch + one atomic replacement
 
         // The injected retype echoes straight back: same physical keys, now in
         // the Russian group, plus the trailing space.
@@ -1171,9 +1188,11 @@ mod tests {
             log.lock().unwrap().clone(),
             vec![
                 Op::Switch(Lang::Ru),
-                Op::Backspaces(1),
-                Op::Type("М".to_string()),
-                Op::Type(" ".to_string()),
+                Op::Replace {
+                    erase: 1,
+                    text: "М".to_string(),
+                    trailing: " ".to_string(),
+                },
             ]
         );
 
@@ -1183,9 +1202,11 @@ mod tests {
             log.lock().unwrap().clone(),
             vec![
                 Op::Switch(Lang::En),
-                Op::Backspaces(2),
-                Op::Type("V".to_string()),
-                Op::Type(" ".to_string()),
+                Op::Replace {
+                    erase: 2,
+                    text: "V".to_string(),
+                    trailing: " ".to_string(),
+                },
             ]
         );
 
@@ -1195,9 +1216,11 @@ mod tests {
             log.lock().unwrap().clone(),
             vec![
                 Op::Switch(Lang::Ru),
-                Op::Backspaces(2),
-                Op::Type("М".to_string()),
-                Op::Type(" ".to_string()),
+                Op::Replace {
+                    erase: 2,
+                    text: "М".to_string(),
+                    trailing: " ".to_string(),
+                },
             ]
         );
     }
@@ -1245,9 +1268,11 @@ mod tests {
     fn expected_ghbdtn_convert() -> Vec<Op> {
         vec![
             Op::Switch(Lang::Ru),
-            Op::Backspaces(7),
-            Op::Type("привет".to_string()),
-            Op::Type(" ".to_string()),
+            Op::Replace {
+                erase: 7,
+                text: "привет".to_string(),
+                trailing: " ".to_string(),
+            },
         ]
     }
 
@@ -1506,15 +1531,8 @@ mod tests {
 
         let (key_tx, key_rx) = crossbeam_channel::unbounded();
         let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-        // Type "ghbdtn" (no space), then press the hotkey twice.
-        for k in [
-            PhysKey::G,
-            PhysKey::H,
-            PhysKey::B,
-            PhysKey::D,
-            PhysKey::T,
-            PhysKey::N,
-        ] {
+        // Type "how" (no space), then press the hotkey twice.
+        for k in [PhysKey::H, PhysKey::O, PhysKey::W] {
             key_tx.send(letter(k)).unwrap();
         }
         key_tx.send(hotkey()).unwrap();
@@ -1528,14 +1546,18 @@ mod tests {
             ops,
             vec![
                 Op::Switch(Lang::Ru),
-                Op::Backspaces(6),
-                Op::Type("привет".to_string()),
-                Op::Type(" ".to_string()),
-                // Second press: toggle back RU -> EN, keeping the space (now on
+                Op::Replace {
+                    erase: 3,
+                    text: "рщц".to_string(),
+                    trailing: " ".to_string(),
+                },
+                // Second press: toggle back RU -> EN, keeping the space.
                 Op::Switch(Lang::En),
-                Op::Backspaces(7),
-                Op::Type("ghbdtn".to_string()),
-                Op::Type(" ".to_string()),
+                Op::Replace {
+                    erase: 4,
+                    text: "how".to_string(),
+                    trailing: " ".to_string(),
+                },
             ]
         );
     }

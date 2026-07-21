@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "mxks-app"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "mxks-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "toml 0.8.2",
@@ -1073,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "mxks-platform"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "core-foundation 0.10.1",
