@@ -11,15 +11,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KLF_SUBSTITUTE_OK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, PostMessageW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    WM_INPUTLANGCHANGEREQUEST,
+    GetForegroundWindow, PostMessageW, WM_INPUTLANGCHANGEREQUEST,
 };
 
 const LANGID_EN: u16 = 0x0409;
 const LANGID_RU: u16 = 0x0419;
 const SWITCH_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
-const NOTEPAD_PLUS_PLUS: &str = "notepad++.exe";
 
 pub struct WinLayout;
 
@@ -27,29 +25,6 @@ pub struct WinLayout;
 enum ActivationPollFailure {
     ForegroundChanged,
     Exhausted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeliveryMode {
-    Posted,
-    Synchronous,
-}
-
-impl DeliveryMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Posted => "posted",
-            Self::Synchronous => "synchronous",
-        }
-    }
-}
-
-fn delivery_mode_for_app(app: Option<&str>) -> DeliveryMode {
-    if app == Some(NOTEPAD_PLUS_PLUS) {
-        DeliveryMode::Synchronous
-    } else {
-        DeliveryMode::Posted
-    }
 }
 
 /// Poll layout activation through injectable observations and waiting. Keeping
@@ -115,40 +90,15 @@ impl crate::LayoutSwitcher for WinLayout {
             bail!("loaded keyboard layout has unexpected language");
         }
 
-        let app = super::foreground_process_name();
-        let delivery_mode = delivery_mode_for_app(app.as_deref());
-        tracing::info!(
-            delivery_mode = delivery_mode.as_str(),
-            app = app.as_deref().unwrap_or("<unknown>"),
-            "keyboard layout change delivery selected"
-        );
-        match delivery_mode {
-            DeliveryMode::Posted => unsafe {
-                PostMessageW(
-                    Some(keyboard.target_hwnd),
-                    WM_INPUTLANGCHANGEREQUEST,
-                    WPARAM(0),
-                    LPARAM(hkl.0 as isize),
-                )
-            }
-            .context("could not queue keyboard layout change for focused window")?,
-            DeliveryMode::Synchronous => {
-                let delivered = unsafe {
-                    SendMessageTimeoutW(
-                        keyboard.target_hwnd,
-                        WM_INPUTLANGCHANGEREQUEST,
-                        WPARAM(0),
-                        LPARAM(hkl.0 as isize),
-                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                        SWITCH_TIMEOUT.as_millis() as u32,
-                        None,
-                    )
-                };
-                if delivered.0 == 0 {
-                    bail!("synchronous keyboard layout change delivery failed or timed out");
-                }
-            }
+        unsafe {
+            PostMessageW(
+                Some(keyboard.target_hwnd),
+                WM_INPUTLANGCHANGEREQUEST,
+                WPARAM(0),
+                LPARAM(hkl.0 as isize),
+            )
         }
+        .context("could not queue keyboard layout change for focused window")?;
 
         let started = Instant::now();
         let result = poll_until_active(
@@ -182,22 +132,6 @@ fn langid(hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL) -> u16 {
 mod tests {
     use super::*;
     use std::cell::Cell;
-
-    #[test]
-    fn only_exact_notepad_process_uses_synchronous_delivery() {
-        assert_eq!(
-            delivery_mode_for_app(Some("notepad++.exe")),
-            DeliveryMode::Synchronous
-        );
-        for app in [
-            None,
-            Some("NOTEPAD++.EXE"),
-            Some("telegram.exe"),
-            Some("chrome.exe"),
-        ] {
-            assert_eq!(delivery_mode_for_app(app), DeliveryMode::Posted);
-        }
-    }
 
     #[test]
     fn delayed_activation_after_many_polls_succeeds() {
