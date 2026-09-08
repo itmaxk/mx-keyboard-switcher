@@ -280,7 +280,9 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
             return;
         }
     };
-    for pixel in rgba.chunks_exact_mut(4) {
+    let (pixels, remainder) = rgba.as_chunks_mut::<4>();
+    debug_assert!(remainder.is_empty());
+    for pixel in pixels {
         pixel.rotate_right(1);
     }
     let tray = AppTray {
@@ -724,8 +726,10 @@ mod tests {
         let (rgba, width, height) = decode_tray_icon().expect("embedded icon");
         assert_eq!((width, height), (32, 32));
         assert_eq!(rgba.len(), 32 * 32 * 4);
-        assert!(rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
-        assert!(rgba.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        let (pixels, remainder) = rgba.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        assert!(pixels.iter().any(|pixel| pixel[3] == 0));
+        assert!(pixels.iter().any(|pixel| pixel[3] != 0));
     }
 }
 
