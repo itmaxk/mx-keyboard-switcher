@@ -27,12 +27,24 @@ fn decode_tray_icon() -> anyhow::Result<(Vec<u8>, u32, u32)> {
 }
 
 #[cfg(feature = "tray")]
+fn choose_log_directory(current_log_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dialog = rfd::FileDialog::new().set_title("Choose diagnostic log folder");
+    if let Some(directory) = current_log_path.parent() {
+        dialog = dialog.set_directory(directory);
+    }
+    dialog.pick_folder()
+}
+
+#[cfg(feature = "tray")]
 struct MenuView {
     enabled: bool,
     autocorrect: bool,
     autocomplete: bool,
+    autocomplete_available: bool,
     terminal_auto: bool,
     autostart: bool,
+    logging_enabled: bool,
+    log_file_text: String,
     hotkey_text: String,
     accept_key_text: String,
     capture_actions_enabled: bool,
@@ -46,8 +58,11 @@ impl From<&Status> for MenuView {
             enabled: status.enabled,
             autocorrect: status.autocorrect,
             autocomplete: status.autocomplete,
+            autocomplete_available: status.autocomplete_available,
             terminal_auto: status.terminal_auto,
             autostart: status.autostart,
+            logging_enabled: status.logging_enabled,
+            log_file_text: "Open log folder".into(),
             hotkey_text: if capture_actions_enabled {
                 format!("Change hotkey (now: {})", status.hotkey)
             } else {
@@ -129,6 +144,7 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
                 .into(),
                 CheckmarkItem {
                     label: "Autocomplete".into(),
+                    enabled: view.autocomplete_available,
                     checked: view.autocomplete,
                     activate: Box::new(|tray: &mut AppTray| {
                         let _ = tray.cmd_tx.send(Command::ToggleAutocomplete);
@@ -157,9 +173,18 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
                 .into(),
                 StandardItem {
                     label: view.accept_key_text,
-                    enabled: view.capture_actions_enabled,
+                    enabled: view.capture_actions_enabled && view.autocomplete_available,
                     activate: Box::new(|tray: &mut AppTray| {
                         let _ = tray.cmd_tx.send(Command::SetAcceptKey);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Cancel key assignment".into(),
+                    enabled: !view.capture_actions_enabled,
+                    activate: Box::new(|tray: &mut AppTray| {
+                        let _ = tray.cmd_tx.send(Command::CancelKeyAssignment);
                     }),
                     ..Default::default()
                 }
@@ -197,6 +222,35 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
                     ..Default::default()
                 }
                 .into(),
+                MenuItem::Separator,
+                CheckmarkItem {
+                    label: "Diagnostic file logging".into(),
+                    checked: view.logging_enabled,
+                    activate: Box::new(|tray: &mut AppTray| {
+                        let _ = tray.cmd_tx.send(Command::ToggleLogging);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: view.log_file_text,
+                    activate: Box::new(|tray: &mut AppTray| {
+                        let _ = tray.cmd_tx.send(Command::OpenLogDirectory);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Choose log folder…".into(),
+                    activate: Box::new(|tray: &mut AppTray| {
+                        if let Some(directory) = choose_log_directory(&tray.status.log_path) {
+                            let _ = tray.cmd_tx.send(Command::SetLogDirectory(directory));
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
                 CheckmarkItem {
                     label: "Start at login".into(),
                     checked: view.autostart,
@@ -270,11 +324,15 @@ mod native {
     const TOGGLE_TERMINAL_AUTO: &str = "toggle-terminal-auto";
     const SET_HOTKEY: &str = "set-hotkey";
     const SET_ACCEPT_KEY: &str = "set-accept-key";
+    const CANCEL_KEY_ASSIGNMENT: &str = "cancel-key-assignment";
     const OPEN_CONFIG: &str = "open-config";
     const RELOAD_CONFIG: &str = "reload-config";
     const EXPORT_AUTOCOMPLETE_COUNTERS: &str = "export-autocomplete-counters";
     const IMPORT_AUTOCOMPLETE_COUNTERS: &str = "import-autocomplete-counters";
     const TOGGLE_AUTOSTART: &str = "toggle-autostart";
+    const TOGGLE_LOGGING: &str = "toggle-logging";
+    const OPEN_LOG_DIRECTORY: &str = "open-log-directory";
+    const CHOOSE_LOG_DIRECTORY: &str = "choose-log-directory";
     const QUIT: &str = "quit";
 
     pub(super) enum UserEvent {
@@ -290,7 +348,10 @@ mod native {
         terminal_auto: CheckMenuItem,
         hotkey: MenuItem,
         accept_key: MenuItem,
+        cancel_key_assignment: MenuItem,
         autostart: CheckMenuItem,
+        logging: CheckMenuItem,
+        log_file: MenuItem,
     }
 
     impl MenuItems {
@@ -298,12 +359,18 @@ mod native {
             self.enabled.set_checked(view.enabled);
             self.autocorrect.set_checked(view.autocorrect);
             self.autocomplete.set_checked(view.autocomplete);
+            self.autocomplete.set_enabled(view.autocomplete_available);
             self.terminal_auto.set_checked(view.terminal_auto);
             self.autostart.set_checked(view.autostart);
+            self.logging.set_checked(view.logging_enabled);
+            self.log_file.set_text(&view.log_file_text);
             self.hotkey.set_text(&view.hotkey_text);
             self.hotkey.set_enabled(view.capture_actions_enabled);
             self.accept_key.set_text(&view.accept_key_text);
-            self.accept_key.set_enabled(view.capture_actions_enabled);
+            self.accept_key
+                .set_enabled(view.capture_actions_enabled && view.autocomplete_available);
+            self.cancel_key_assignment
+                .set_enabled(!view.capture_actions_enabled);
         }
     }
 
@@ -335,7 +402,7 @@ mod native {
             let autocomplete = CheckMenuItem::with_id(
                 TOGGLE_AUTOCOMPLETE,
                 "Autocomplete",
-                true,
+                view.autocomplete_available,
                 view.autocomplete,
                 None,
             );
@@ -355,7 +422,13 @@ mod native {
             let accept_key = MenuItem::with_id(
                 SET_ACCEPT_KEY,
                 &view.accept_key_text,
-                view.capture_actions_enabled,
+                view.capture_actions_enabled && view.autocomplete_available,
+                None,
+            );
+            let cancel_key_assignment = MenuItem::with_id(
+                CANCEL_KEY_ASSIGNMENT,
+                "Cancel key assignment",
+                !view.capture_actions_enabled,
                 None,
             );
             let open_config = MenuItem::with_id(OPEN_CONFIG, "Open config file", true, None);
@@ -379,6 +452,16 @@ mod native {
                 view.autostart,
                 None,
             );
+            let logging = CheckMenuItem::with_id(
+                TOGGLE_LOGGING,
+                "Diagnostic file logging",
+                true,
+                view.logging_enabled,
+                None,
+            );
+            let log_file = MenuItem::with_id(OPEN_LOG_DIRECTORY, &view.log_file_text, true, None);
+            let choose_log_directory =
+                MenuItem::with_id(CHOOSE_LOG_DIRECTORY, "Choose log folder…", true, None);
             let quit = MenuItem::with_id(QUIT, "Quit", true, None);
 
             menu.append_items(&[
@@ -389,11 +472,17 @@ mod native {
                 &PredefinedMenuItem::separator(),
                 &hotkey,
                 &accept_key,
+                &cancel_key_assignment,
                 &PredefinedMenuItem::separator(),
                 &open_config,
                 &reload_config,
                 &export_autocomplete_counters,
                 &import_autocomplete_counters,
+                &PredefinedMenuItem::separator(),
+                &logging,
+                &log_file,
+                &choose_log_directory,
+                &PredefinedMenuItem::separator(),
                 &autostart,
                 &PredefinedMenuItem::separator(),
                 &quit,
@@ -422,7 +511,10 @@ mod native {
                     terminal_auto,
                     hotkey,
                     accept_key,
+                    cancel_key_assignment,
                     autostart,
+                    logging,
+                    log_file,
                 },
             })
         }
@@ -454,7 +546,12 @@ mod native {
             match event {
                 UserEvent::Menu(event) => {
                     let is_quit = event.id.0 == QUIT;
-                    if let Some(command) = command_for_menu_id(&event.id) {
+                    if event.id.0 == CHOOSE_LOG_DIRECTORY {
+                        if let Some(directory) = super::choose_log_directory(&self.status.log_path)
+                        {
+                            let _ = self.cmd_tx.send(Command::SetLogDirectory(directory));
+                        }
+                    } else if let Some(command) = command_for_menu_id(&event.id) {
                         if self.cmd_tx.send(command).is_err() {
                             tracing::warn!("keyboard engine command channel disconnected");
                             if is_quit {
@@ -482,11 +579,14 @@ mod native {
             TOGGLE_TERMINAL_AUTO => Some(Command::ToggleTerminalAuto),
             SET_HOTKEY => Some(Command::SetHotkey),
             SET_ACCEPT_KEY => Some(Command::SetAcceptKey),
+            CANCEL_KEY_ASSIGNMENT => Some(Command::CancelKeyAssignment),
             OPEN_CONFIG => Some(Command::OpenConfig),
             RELOAD_CONFIG => Some(Command::ReloadConfig),
             EXPORT_AUTOCOMPLETE_COUNTERS => Some(Command::ExportAutocompleteCounters),
             IMPORT_AUTOCOMPLETE_COUNTERS => Some(Command::ImportAutocompleteCounters),
             TOGGLE_AUTOSTART => Some(Command::ToggleAutostart),
+            TOGGLE_LOGGING => Some(Command::ToggleLogging),
+            OPEN_LOG_DIRECTORY => Some(Command::OpenLogDirectory),
             QUIT => Some(Command::Quit),
             _ => None,
         }
@@ -590,9 +690,12 @@ mod tests {
             hotkey: "Pause".into(),
             capturing,
             autocomplete: false,
+            autocomplete_available: true,
             terminal_auto: true,
             accept_key: "Tab".into(),
             autostart: true,
+            logging_enabled: false,
+            log_path: std::env::temp_dir().join("mxks.log"),
         }
     }
 
@@ -604,6 +707,8 @@ mod tests {
         assert!(!normal.autocomplete);
         assert!(normal.terminal_auto);
         assert!(normal.autostart);
+        assert!(!normal.logging_enabled);
+        assert_eq!(normal.log_file_text, "Open log folder");
         assert_eq!(normal.hotkey_text, "Change hotkey (now: Pause)");
         assert_eq!(normal.accept_key_text, "Change accept key (now: Tab)");
         assert!(normal.capture_actions_enabled);
@@ -643,6 +748,7 @@ mod native_tests {
             ("toggle-terminal-auto", Command::ToggleTerminalAuto),
             ("set-hotkey", Command::SetHotkey),
             ("set-accept-key", Command::SetAcceptKey),
+            ("cancel-key-assignment", Command::CancelKeyAssignment),
             ("open-config", Command::OpenConfig),
             ("reload-config", Command::ReloadConfig),
             (
@@ -654,6 +760,8 @@ mod native_tests {
                 Command::ImportAutocompleteCounters,
             ),
             ("toggle-autostart", Command::ToggleAutostart),
+            ("toggle-logging", Command::ToggleLogging),
+            ("open-log-directory", Command::OpenLogDirectory),
             ("quit", Command::Quit),
         ];
         for (id, expected) in cases {

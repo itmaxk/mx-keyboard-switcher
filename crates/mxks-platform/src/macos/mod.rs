@@ -5,6 +5,7 @@
 //! Requires the **Accessibility** permission to receive events; the tap simply
 //! yields nothing until it is granted.
 
+mod focus;
 mod inject;
 mod keymap;
 mod layout;
@@ -13,7 +14,7 @@ mod tap;
 use anyhow::Result;
 use mxks_core::hotkey::HotkeySpec;
 
-use crate::{Backend, FocusInfo};
+use crate::Backend;
 
 /// Tag written to injected events' user-data field.
 pub const MAGIC: i64 = 0x4B42_5357; // "KBSW"
@@ -25,7 +26,7 @@ pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
         capture: Box::new(tap::MacCapture::new(control, icontrol)),
         injector: Box::new(inject::MacInjector::new()?),
         layout: Box::new(layout::MacLayout),
-        focus: Box::new(MacFocus),
+        focus: Box::new(focus::MacFocus::default()),
         hotkey: handle,
         intercept: ihandle,
         // No overlay on macOS yet (needs an NSPanel via objc2); the stub keeps
@@ -33,8 +34,3 @@ pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
         overlay: Box::new(crate::StubOverlay),
     })
 }
-
-/// macOS blinds event taps automatically while Secure Input is active (password
-/// fields), so no explicit password-field check is needed here.
-struct MacFocus;
-impl FocusInfo for MacFocus {}

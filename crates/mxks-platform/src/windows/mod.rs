@@ -20,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
 
-use crate::{Backend, FocusInfo};
+use crate::{Backend, FocusInfo, FocusState};
 
 /// Tag written to `dwExtraInfo` on every injected event.
 pub const MAGIC: usize = 0x4B42_5357; // "KBSW"
@@ -86,7 +86,7 @@ pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
         capture: Box::new(hook::WinCapture::new(control, icontrol)),
         injector: Box::new(inject::WinInjector),
         layout: Box::new(layout::WinLayout),
-        focus: Box::new(WinFocus),
+        focus: Box::new(WinFocus::default()),
         hotkey: handle,
         intercept: ihandle,
         overlay: Box::new(overlay::WinOverlay),
@@ -96,7 +96,10 @@ pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
 /// Best-effort focus info. Password-field detection is not yet implemented on
 /// Windows (planned via UI Automation); the per-app mode is driven by the
 /// foreground window's process executable name.
-struct WinFocus;
+#[derive(Default)]
+struct WinFocus {
+    last: Option<(usize, usize, u32, u64)>,
+}
 
 pub(super) fn foreground_process_name() -> Option<String> {
     unsafe {
@@ -127,6 +130,48 @@ pub(super) fn foreground_process_name() -> Option<String> {
 }
 
 impl FocusInfo for WinFocus {
+    fn monitors_focus(&self) -> bool {
+        true
+    }
+
+    fn poll_focus(&mut self) -> FocusState {
+        // Unlike layout routing, focus tracking must not fall back to a
+        // top-level window when the actual focused control cannot be read.
+        let read = || unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_invalid() {
+                return None;
+            }
+            let thread = GetWindowThreadProcessId(hwnd, None);
+            if thread == 0 {
+                return None;
+            }
+            let mut gui = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            GetGUIThreadInfo(thread, &mut gui).ok()?;
+            if gui.hwndFocus.is_invalid() || GetForegroundWindow() != hwnd {
+                return None;
+            }
+            Some((
+                hwnd.0 as usize,
+                gui.hwndFocus.0 as usize,
+                thread,
+                hook::focus_revision(),
+            ))
+        };
+        let Some(current) = read() else {
+            self.last = None;
+            return FocusState::Unavailable;
+        };
+        if self.last.replace(current) == Some(current) {
+            FocusState::Unchanged
+        } else {
+            FocusState::Changed
+        }
+    }
+
     /// Lowercased executable basename of the foreground window's process,
     /// e.g. "telegram.exe" — the Windows analog of the X11 WM_CLASS.
     fn focused_app(&self) -> Option<String> {

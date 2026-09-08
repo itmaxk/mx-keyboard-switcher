@@ -1,6 +1,7 @@
 //! The engine: consumes key events and tray commands, maintains the word
 //! buffer, and drives detection + correction.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -11,7 +12,8 @@ use mxks_core::detect::{analyze, Params, Verdict};
 use mxks_core::layout::Lang;
 use mxks_core::usage::WordUsage;
 use mxks_platform::{
-    CaptureTarget, FocusInfo, HotkeyHandle, InterceptHandle, KeyEvent, KeyKind, OverlayCmd,
+    CaptureTarget, FocusInfo, FocusState, HotkeyHandle, InterceptHandle, KeyEvent, KeyKind,
+    OverlayCmd,
 };
 
 use crate::corrector::Corrector;
@@ -53,7 +55,7 @@ pub enum Command {
     ToggleAutocorrect,
     /// Open the config file in the default editor.
     OpenConfig,
-    /// Reload config from disk (does not change the capture hotkey).
+    /// Reload config and hotkeys from disk, retaining live settings on error.
     ReloadConfig,
     /// Arm "press a key" capture to reassign the conversion hotkey.
     SetHotkey,
@@ -63,8 +65,16 @@ pub enum Command {
     ToggleTerminalAuto,
     /// Arm "press a key" capture to reassign the autocomplete accept key.
     SetAcceptKey,
+    /// Stop waiting for a key assignment.
+    CancelKeyAssignment,
     /// Toggle the OS "start at login" entry.
     ToggleAutostart,
+    /// Toggle diagnostic file logging.
+    ToggleLogging,
+    /// Change the directory containing the diagnostic log.
+    SetLogDirectory(PathBuf),
+    /// Open the directory containing the diagnostic log.
+    OpenLogDirectory,
     /// Export autocomplete acceptance counters to the portable transfer file.
     ExportAutocompleteCounters,
     /// Import autocomplete acceptance counters from the portable transfer file.
@@ -98,6 +108,7 @@ pub struct Status {
     pub capturing: bool,
     /// Autocomplete on/off (false also when the platform has no overlay).
     pub autocomplete: bool,
+    pub autocomplete_available: bool,
     /// Whether terminals get full auto (vs manual-only).
     pub terminal_auto: bool,
     /// Current accept key, human-readable (e.g. "Tab").
@@ -105,6 +116,10 @@ pub struct Status {
     /// Whether an OS "start at login" entry exists (source of truth is the OS,
     /// not the config file).
     pub autostart: bool,
+    /// Whether diagnostic events are currently written to a file.
+    pub logging_enabled: bool,
+    /// Effective diagnostic log path used by the tray folder picker.
+    pub log_path: PathBuf,
 }
 
 /// The result of the most recent *manual* conversion, kept so the hotkey can
@@ -143,6 +158,9 @@ pub struct Engine {
     status_tx: Option<Sender<Status>>,
     /// Full dictionary candidate currently offered to the user.
     suggestion: Option<Suggestion>,
+    /// A queued accept from the previous input target must never replay Tab
+    /// into the new target after an idle focus check dismissed its suggestion.
+    discard_stale_accept: bool,
     /// Locally learned autocomplete acceptance counters.
     usage: UsageStore,
     /// Channel to the overlay thread (non-blocking sends only).
@@ -154,6 +172,8 @@ pub struct Engine {
     active_accept: Option<String>,
     /// False when the platform has no overlay — autocomplete stays inert.
     overlay_available: bool,
+    /// Runtime control for the process-wide diagnostic file writer.
+    logging: Option<crate::logging::LogController>,
 }
 
 impl Engine {
@@ -178,11 +198,13 @@ impl Engine {
             last_correction: None,
             status_tx: None,
             suggestion: None,
+            discard_stale_accept: false,
             usage: UsageStore::memory(WordUsage::default()),
             overlay_tx: None,
             intercept: None,
             active_accept: None,
             overlay_available: false,
+            logging: None,
         }
     }
 
@@ -210,16 +232,35 @@ impl Engine {
         self
     }
 
+    pub fn with_logging(mut self, logging: crate::logging::LogController) -> Self {
+        self.logging = Some(logging);
+        self
+    }
+
     pub fn status(&self) -> Status {
+        let (logging_enabled, log_path) = match &self.logging {
+            Some(logging) => (logging.enabled(), logging.path()),
+            None => {
+                let directory = crate::config_io::log_dir(&self.config.logging.directory)
+                    .unwrap_or_else(|_| std::env::temp_dir().join("mx-keyboard-switcher"));
+                (
+                    self.config.logging.enabled,
+                    crate::config_io::log_path(&directory),
+                )
+            }
+        };
         Status {
             enabled: self.enabled,
             autocorrect: self.config.general.autocorrect,
             hotkey: self.config.hotkeys.convert_last_word.clone(),
             capturing: self.capturing,
             autocomplete: self.config.autocomplete.enabled && self.overlay_available,
+            autocomplete_available: self.overlay_available,
             terminal_auto: self.config.terminals.auto,
             accept_key: self.config.autocomplete.accept_key.clone(),
             autostart: crate::autostart::is_enabled(),
+            logging_enabled,
+            log_path,
         }
     }
 
@@ -229,25 +270,35 @@ impl Engine {
         }
     }
 
-    /// Main loop. Returns when either channel closes or `Quit` is received.
+    /// Main loop. Keyboard capture is required; tray commands and hotkey
+    /// assignments are optional. Disconnected optional channels must leave the
+    /// select set: a disconnected receiver is always ready and would busy-loop.
+    /// Returns when capture closes or `Quit` is received.
     pub fn run(&mut self, key_rx: Receiver<KeyEvent>, cmd_rx: Receiver<Command>) {
         self.broadcast_status();
-        let hk_rx = self.hotkey.updates().clone();
+        let mut cmd_rx = cmd_rx;
+        let mut hk_rx = self.hotkey.updates().clone();
+        let focus_tick = if self.focus.monitors_focus() {
+            crossbeam_channel::tick(Duration::from_millis(100))
+        } else {
+            crossbeam_channel::never()
+        };
         loop {
             crossbeam_channel::select! {
+                recv(focus_tick) -> _ => { self.refresh_focus(); },
                 recv(key_rx) -> msg => match msg {
                     Ok(ev) => self.handle_key(ev),
                     Err(_) => break,
                 },
-                recv(cmd_rx) -> msg => {
-                    if let Ok(cmd) = msg {
+                recv(cmd_rx) -> msg => match msg {
+                    Ok(cmd) => {
                         if self.handle_command(cmd) { break; }
-                    }
+                    },
+                    Err(_) => cmd_rx = crossbeam_channel::never(),
                 },
-                recv(hk_rx) -> msg => {
-                    if let Ok((target, spec)) = msg {
-                        self.on_key_assigned(target, spec);
-                    }
+                recv(hk_rx) -> msg => match msg {
+                    Ok((target, spec)) => self.on_key_assigned(target, spec),
+                    Err(_) => hk_rx = crossbeam_channel::never(),
                 },
             }
         }
@@ -285,6 +336,12 @@ impl Engine {
         if !ev.down || ev.injected {
             return;
         }
+        let focus = self.refresh_focus();
+        if focus == FocusState::Unavailable
+            || (focus == FocusState::Changed && matches!(ev.kind, KeyKind::Accept))
+        {
+            return;
+        }
         // Any real typing invalidates the manual-conversion toggle.
         if !matches!(ev.kind, KeyKind::Hotkey) {
             if self.toggle.is_some() {
@@ -320,6 +377,7 @@ impl Engine {
             }
             KeyKind::Reset => {
                 self.dismiss_suggestion();
+                self.discard_stale_accept = true;
                 self.buffer.feed(Event::Reset);
                 self.last = None;
             }
@@ -329,6 +387,19 @@ impl Engine {
             }
             KeyKind::Accept => self.on_accept(),
         }
+    }
+
+    fn refresh_focus(&mut self) -> FocusState {
+        let state = self.focus.poll_focus();
+        if state != FocusState::Unchanged {
+            self.discard_stale_accept = true;
+            self.dismiss_suggestion();
+            self.buffer.clear();
+            self.last = None;
+            self.toggle = None;
+            self.last_correction = None;
+        }
+        state
     }
 
     /// Recompute the completion for the in-progress word and sync the overlay
@@ -351,6 +422,7 @@ impl Engine {
         match &want {
             // Re-send even when unchanged so the hint follows the caret.
             Some(suggestion) => {
+                self.discard_stale_accept = false;
                 // Pick the accept key for this app: terminals may use a separate
                 // one so the global Tab does not hijack shell completion.
                 let key = if is_terminal {
@@ -448,6 +520,10 @@ impl Engine {
     /// The accept key fired (and was swallowed by the backend where possible).
     fn on_accept(&mut self) {
         let Some(suggestion) = self.suggestion.take() else {
+            if self.discard_stale_accept {
+                self.set_intercept(false);
+                return;
+            }
             // Stale accept: the suggestion was dismissed while the keypress was
             // in flight. Replay a real Tab so the user's keystroke isn't lost
             // (other accept keys are inert on their own — just drop those).
@@ -668,7 +744,34 @@ impl Engine {
                 self.broadcast_status();
             }
             Command::ReloadConfig => {
-                self.config = crate::config_io::load();
+                let config = match crate::config_io::reload() {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::warn!(
+                            "keeping current settings; could not reload config: {error:#}"
+                        );
+                        return false;
+                    }
+                };
+                self.config = config;
+                if let Some(logging) = &self.logging {
+                    match crate::config_io::log_dir(&self.config.logging.directory) {
+                        Ok(directory) => {
+                            if let Err(error) = logging.set_directory(&directory) {
+                                tracing::warn!(
+                                    "could not apply configured log directory {}: {error:#}",
+                                    directory.display()
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("could not resolve configured log directory: {error:#}")
+                        }
+                    }
+                    if let Err(error) = logging.set_enabled(self.config.logging.enabled) {
+                        tracing::warn!("could not apply configured logging switch: {error:#}");
+                    }
+                }
                 // A visible suggestion may now be stale.
                 self.dismiss_suggestion();
                 // Re-apply the convert hotkey (the capture backend reads it live,
@@ -689,6 +792,7 @@ impl Engine {
                 }
             }
             Command::SetHotkey => {
+                self.dismiss_suggestion();
                 self.capturing = true;
                 self.hotkey.begin_capture(CaptureTarget::ConvertHotkey);
                 tracing::info!("press a key (optionally with modifiers) to set the hotkey");
@@ -719,9 +823,15 @@ impl Engine {
                 self.broadcast_status();
             }
             Command::SetAcceptKey => {
+                self.dismiss_suggestion();
                 self.capturing = true;
                 self.hotkey.begin_capture(CaptureTarget::AcceptKey);
                 tracing::info!("press a key (optionally with modifiers) to set the accept key");
+                self.broadcast_status();
+            }
+            Command::CancelKeyAssignment => {
+                self.hotkey.cancel_capture();
+                self.capturing = false;
                 self.broadcast_status();
             }
             Command::ToggleAutostart => {
@@ -731,6 +841,64 @@ impl Engine {
                 }
                 tracing::info!("autostart = {on}");
                 self.broadcast_status();
+            }
+            Command::ToggleLogging => {
+                if let Some(logging) = &self.logging {
+                    let on = !logging.enabled();
+                    match logging.set_enabled(on) {
+                        Ok(()) => {
+                            self.config.logging.enabled = on;
+                            if let Err(error) = crate::config_io::save_logging_enabled(on) {
+                                tracing::warn!("could not save logging switch: {error:#}");
+                            }
+                            tracing::info!(
+                                file_logging = on,
+                                log_path = %logging.path().display(),
+                                "file logging changed"
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            log_path = %logging.path().display(),
+                            "could not enable file logging: {error:#}"
+                        ),
+                    }
+                    self.broadcast_status();
+                }
+            }
+            Command::SetLogDirectory(directory) => {
+                if let Some(logging) = &self.logging {
+                    match logging.set_directory(&directory) {
+                        Ok(()) => {
+                            self.config.logging.directory =
+                                directory.to_string_lossy().into_owned();
+                            if let Err(error) = crate::config_io::save_log_directory(&directory) {
+                                tracing::warn!("could not save log directory: {error:#}");
+                            }
+                            tracing::info!(
+                                log_path = %logging.path().display(),
+                                "log directory changed"
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            log_path = %crate::config_io::log_path(&directory).display(),
+                            "could not change log directory: {error:#}"
+                        ),
+                    }
+                    self.broadcast_status();
+                }
+            }
+            Command::OpenLogDirectory => {
+                if let Some(logging) = &self.logging {
+                    let directory = logging.directory();
+                    if let Err(error) = std::fs::create_dir_all(&directory) {
+                        tracing::warn!(
+                            "could not create log directory {}: {error:#}",
+                            directory.display()
+                        );
+                    } else {
+                        crate::open_path(&directory);
+                    }
+                }
             }
             Command::ExportAutocompleteCounters => match self.usage.export() {
                 Ok(path) => {
@@ -1078,6 +1246,168 @@ mod tests {
         Engine::new(Config::default(), corrector, Box::new(MockFocus), hk_handle)
     }
 
+    struct ChangingFocus(Arc<Mutex<FocusState>>);
+
+    impl FocusInfo for ChangingFocus {
+        fn monitors_focus(&self) -> bool {
+            true
+        }
+        fn poll_focus(&mut self) -> FocusState {
+            let mut state = self.0.lock().unwrap();
+            let current = *state;
+            if current == FocusState::Changed {
+                *state = FocusState::Unchanged;
+            }
+            current
+        }
+    }
+
+    #[test]
+    fn programmatic_focus_change_drops_word_and_manual_toggle() {
+        for next_key in [space(), hotkey()] {
+            let log: Log = Arc::new(Mutex::new(Vec::new()));
+            let mut engine = bare_engine(log.clone());
+            let state = Arc::new(Mutex::new(FocusState::Unchanged));
+            engine.focus = Box::new(ChangingFocus(state.clone()));
+            for ev in ghbdtn() {
+                engine.handle_key(ev);
+            }
+            *state.lock().unwrap() = FocusState::Changed;
+            engine.handle_key(next_key);
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "edited text in the new focus"
+            );
+            type_wrong_privet(&mut engine);
+            assert!(
+                !log.lock().unwrap().is_empty(),
+                "tracking must recover in the new field"
+            );
+        }
+
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = bare_engine(log.clone());
+        let state = Arc::new(Mutex::new(FocusState::Unchanged));
+        engine.focus = Box::new(ChangingFocus(state.clone()));
+        for ev in ghbdtn() {
+            engine.handle_key(ev);
+        }
+        engine.handle_key(hotkey());
+        log.lock().unwrap().clear();
+        *state.lock().unwrap() = FocusState::Changed;
+        engine.handle_key(hotkey());
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "manual toggle crossed a focus change"
+        );
+    }
+
+    #[test]
+    fn unavailable_focus_blocks_input_and_stale_completion() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, _overlay, control) = autocomplete_engine(log.clone());
+        let state = Arc::new(Mutex::new(FocusState::Unchanged));
+        engine.focus = Box::new(ChangingFocus(state.clone()));
+        type_lowercase(&mut engine, "hel");
+        assert!(control.is_active());
+        *state.lock().unwrap() = FocusState::Unavailable;
+        engine.handle_key(accept());
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "stale completion or Tab was injected"
+        );
+        assert!(!control.is_active());
+        for ev in ghbdtn() {
+            engine.handle_key(ev);
+        }
+        engine.handle_key(hotkey());
+        assert!(engine.buffer.is_empty());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn idle_focus_change_hides_overlay_and_drops_queued_accept() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (mut engine, overlay, control) = autocomplete_engine(log.clone());
+        let state = Arc::new(Mutex::new(FocusState::Unchanged));
+        engine.focus = Box::new(ChangingFocus(state.clone()));
+        type_lowercase(&mut engine, "hel");
+        assert!(control.is_active());
+        while overlay.try_recv().is_ok() {}
+        *state.lock().unwrap() = FocusState::Changed;
+        let (keys, key_rx) = crossbeam_channel::unbounded();
+        let (_commands, cmd_rx) = crossbeam_channel::unbounded();
+        let thread = std::thread::spawn(move || engine.run(key_rx, cmd_rx));
+        let hidden = overlay.recv_timeout(Duration::from_secs(2));
+        // Always release the engine even when a regression causes the timeout.
+        keys.send(accept()).unwrap();
+        drop(keys);
+        thread.join().unwrap();
+        assert_eq!(hidden.unwrap(), OverlayCmd::Hide);
+        assert!(!control.is_active());
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "queued accept injected into new field"
+        );
+    }
+
+    /// Exercise the real select loop with the same disconnect as a failed tray
+    /// startup. CPU is measured on this thread only, excluding other tests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disconnected_optional_channels_do_not_spin_or_stop_keyboard_processing() {
+        fn thread_cpu_ticks() -> u64 {
+            let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect();
+            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        }
+
+        for (close_commands, close_assignments) in [(true, false), (false, true), (true, true)] {
+            let log: Log = Arc::new(Mutex::new(Vec::new()));
+            let mut engine = bare_engine(log.clone());
+            let (control, handle) = mxks_platform::hotkey_channel(Default::default());
+            engine.hotkey = handle;
+            let control = (!close_assignments).then_some(control);
+            let (key_tx, key_rx) = crossbeam_channel::unbounded();
+            let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+            let cmd_tx = (!close_commands).then_some(cmd_tx);
+
+            let driver = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(350));
+                for key in [
+                    PhysKey::G,
+                    PhysKey::H,
+                    PhysKey::B,
+                    PhysKey::D,
+                    PhysKey::T,
+                    PhysKey::N,
+                ] {
+                    key_tx.send(letter(key)).unwrap();
+                }
+                key_tx.send(space()).unwrap();
+                // Closing the mandatory input channel terminates the engine.
+            });
+            let cpu_before = thread_cpu_ticks();
+            engine.run(key_rx, cmd_rx);
+            let cpu_ticks = thread_cpu_ticks() - cpu_before;
+            driver.join().unwrap();
+            drop((control, cmd_tx));
+            assert!(
+                log.lock().unwrap().iter().any(|op| matches!(op,
+                    Op::Replace { text, .. } if text == "привет"
+                )),
+                "keyboard processing stopped after an optional channel disconnected"
+            );
+            assert!(cpu_ticks < 5,
+                "idle engine used {cpu_ticks} CPU ticks with commands closed={close_commands}, assignments closed={close_assignments}");
+        }
+    }
+
     fn type_wrong_privet(engine: &mut Engine) {
         for k in [
             PhysKey::G,
@@ -1248,10 +1578,62 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
     }
 
+    #[test]
+    fn native_terminal_identifiers_default_to_manual_only() {
+        for app in [
+            "com.apple.terminal terminal",
+            "com.googlecode.iterm2 iterm2",
+            "com.mitchellh.ghostty ghostty",
+            "windowsterminal.exe",
+            "powershell.exe",
+            "pwsh.exe",
+            "cmd.exe",
+            "conhost.exe",
+            "openconsole.exe",
+            "mintty.exe",
+        ] {
+            let log: Log = Arc::new(Mutex::new(Vec::new()));
+            let (mut engine, _control) = mode_engine(Config::default(), app, log.clone());
+            for ev in ghbdtn() {
+                engine.handle_key(ev);
+            }
+            engine.handle_key(space());
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "autocorrected shell input in {app}"
+            );
+            engine.handle_key(hotkey());
+            assert!(
+                !log.lock().unwrap().is_empty(),
+                "manual conversion unavailable in {app}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_bundle_and_app_names_honor_password_manager_exclusions() {
+        for app in [
+            "com.agilebits.onepassword7 1password",
+            "com.bitwarden.desktop bitwarden",
+            "org.keepassxc.keepassxc keepassxc",
+        ] {
+            let log: Log = Arc::new(Mutex::new(Vec::new()));
+            let (mut engine, _control) = mode_engine(Config::default(), app, log.clone());
+            for ev in ghbdtn() {
+                engine.handle_key(ev);
+            }
+            engine.handle_key(space());
+            engine.handle_key(hotkey());
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "edited text in excluded app {app}"
+            );
+        }
+    }
+
     /// Build an engine whose focus reports `app`, with a custom config, for the
     /// per-app mode tests. Returns the hotkey control side too so the caller
-    /// keeps it alive (a dropped control disconnects the updates channel and
-    /// makes `run`'s select! busy-spin).
+    /// keeps the assignment channel available for tests that use it.
     fn mode_engine(config: Config, app: &str, log: Log) -> (Engine, mxks_platform::HotkeyControl) {
         let corrector = Corrector::new(
             Box::new(MockInjector(log.clone())),

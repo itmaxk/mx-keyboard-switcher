@@ -1,0 +1,13 @@
+[Unit]
+Description=Еженедельная очистка кэша сборки MX Keyboard Switcher
+
+[Timer]
+# Раз в неделю (пн 00:00). Persistent — догоняет пропущенный запуск,
+# если машина была выключена в назначенное время.
+OnCalendar=weekly
+Persistent=true
+# Разброс до часа, чтобы не стартовать ровно в полночь под нагрузкой.
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

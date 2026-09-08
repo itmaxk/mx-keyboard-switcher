@@ -13,7 +13,7 @@ path = "src/main.rs"
 # Native tray icon. On by default; disable with `--no-default-features` to
 # build a headless binary.
 default = ["tray"]
-tray = ["dep:image", "dep:ksni", "dep:tray-icon", "dep:winit"]
+tray = ["dep:image", "dep:ksni", "dep:rfd", "dep:tray-icon", "dep:winit"]
 
 [dependencies]
 mxks-core = { path = "../mxks-core" }
@@ -21,11 +21,13 @@ mxks-platform = { path = "../mxks-platform" }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+toml_edit = "0.20"
 dirs = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # HKCU Run-key access for the "Start at login" toggle.

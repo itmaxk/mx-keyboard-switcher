@@ -22,7 +22,7 @@ single binary per OS.
   in the config — matching is by key name, so any key or chord works.
 - **System tray**: enable/disable, toggle autocorrection, autocomplete and
   terminal mode, change hotkeys, export/import autocomplete counters, open/reload
-  config, toggle start at login.
+  config, manage diagnostic file logging, toggle start at login.
 - **Autocomplete learning**: only accepting a shown completion (including
   manually finishing that same suggestion and confirming it) increments its
   local word counter. Learned words can appear after one character and rank by
@@ -147,8 +147,27 @@ extra_en = []             # extra valid words (never "corrected")
 extra_ru = []
 ```
 
-Edit the file and choose **Reload config** from the tray (changing the hotkey
-requires a restart).
+Edit the file and choose **Reload config** from the tray. Hotkey changes take
+effect immediately; an invalid config leaves the previous settings active.
+
+Terminal, iTerm2, Ghostty and common Windows terminals default to manual-only
+mode. If an older config explicitly lists `[terminals].apps`, add the relevant
+app names (macOS bundle IDs are also supported), or remove that key to use the
+updated defaults. Explicit lists are preserved when upgrading.
+
+On Windows/macOS, changing the focused input clears tracked words and hints.
+If the focused input cannot be read, correction pauses until it is available;
+macOS requires Accessibility permission for this check as well as key capture.
+
+Diagnostic file logging is off by default. Enable **Diagnostic file logging**
+in the tray, use **Choose log folder…** to select a directory, and **Open log
+folder** to inspect it. The default `mxks.log` locations are:
+
+- Linux: `${XDG_STATE_HOME:-~/.local/state}/mx-keyboard-switcher/mxks.log`
+- macOS: `~/Library/Logs/MX Keyboard Switcher/mxks.log`
+- Windows: `%LOCALAPPDATA%\MX Keyboard Switcher\Logs\mxks.log`
+
+The log can contain converted words; inspect it before sharing.
 
 ## Limitations (v1)
 
@@ -157,6 +176,8 @@ requires a restart).
 - Per-app exclusions and password-field detection are best-effort and currently
   Linux-first.
 - Wayland is X11/XWayland-only (see above).
+- Autocomplete overlays are implemented on Linux/X11 and Windows; autocomplete
+  is currently unavailable on macOS.
 
 ## Development
 
@@ -164,9 +185,13 @@ requires a restart).
 cargo test --workspace            # unit + corpus tests (0 false positives gate)
 cargo clippy --workspace --all-targets
 
-# Live Linux/X11 integration tests (require an X server with ru/us layouts):
-cargo test -p mxks-platform --test x11_live -- --ignored --test-threads=1
+# Live Linux/X11 integration tests (creates an isolated Xvfb display):
+scripts/run-x11-live-tests.sh
 ```
+
+Run the Linux daemon for development only in a separate Xvfb/Xephyr session or
+disposable X11 VM. Never run it or ignored live tests on the working desktop
+display (including `:10`); synthetic keystrokes reach the focused application.
 
 See [`docs/manual-test.md`](docs/manual-test.md) for the per-OS manual test
 checklist.

@@ -1,0 +1,13 @@
+[Unit]
+Description=MX Keyboard Switcher: очистка устаревшего кэша сборки (cargo-sweep + npm)
+Documentation=file:%h/orca/projects/KeyBoardSwitcher/scripts/cleanup-build-cache.sh
+
+[Service]
+Type=oneshot
+# cargo/cargo-sweep живут в ~/.cargo/bin — добавляем в PATH явно,
+# т.к. окружение systemd --user минимально.
+Environment=PATH=%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/orca/projects/KeyBoardSwitcher/scripts/cleanup-build-cache.sh
+# Низкий приоритет CPU/IO, чтобы чистка не мешала работе.
+Nice=19
+IOSchedulingClass=idle

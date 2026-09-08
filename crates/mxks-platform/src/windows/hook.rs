@@ -4,20 +4,23 @@
 //! global set before the hook is installed. Injected events (tagged with
 //! `dwExtraInfo == MAGIC`) are ignored here, which is race-free.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::{HotkeyControl, InterceptControl};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use mxks_core::hotkey::HotkeySpec;
-use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    UnhookWindowsHookEx, EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, HC_ACTION, KBDLLHOOKSTRUCT,
+    LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINEVENT_OUTOFCONTEXT, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
 };
 
 use super::keymap;
@@ -38,6 +41,60 @@ struct Shared {
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
+static FOCUS_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn focus_revision() -> u64 {
+    FOCUS_REVISION.load(Ordering::SeqCst)
+}
+
+// Some apps expose multiple accessible fields in the same HWND. Their native
+// focus notifications invalidate that shared handle even when GUIThreadInfo
+// stays identical. No injected DLL or polling thread is needed.
+unsafe extern "system" fn focus_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    _hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if matches!(event, EVENT_SYSTEM_FOREGROUND | EVENT_OBJECT_FOCUS) {
+        FOCUS_REVISION.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct FocusHooks(Vec<HWINEVENTHOOK>);
+
+impl FocusHooks {
+    unsafe fn install() -> Result<Self> {
+        let mut hooks = Self(Vec::new());
+        for event in [EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_FOCUS] {
+            let hook = SetWinEventHook(
+                event,
+                event,
+                None,
+                Some(focus_event_proc),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            if hook.is_invalid() {
+                anyhow::bail!("could not install focus event hook");
+            }
+            hooks.0.push(hook);
+        }
+        Ok(hooks)
+    }
+}
+
+impl Drop for FocusHooks {
+    fn drop(&mut self) {
+        for hook in &self.0 {
+            let _ = unsafe { UnhookWinEvent(*hook) };
+        }
+    }
+}
 
 /// VK whose next key-up must be swallowed (we ate its key-down as `Accept`);
 /// 0 when none. Keeps apps from seeing an orphan key-up.
@@ -275,18 +332,59 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     CallNextHookEx(None, code, wparam, lparam)
 }
 
+/// Clicks may move the caret or focus; mouse motion, scrolling and releases
+/// leave the tracked word alone. Synthetic input must not invalidate it.
+fn mouse_resets_buffer(message: u32, mouse: &MSLLHOOKSTRUCT) -> bool {
+    matches!(
+        message,
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+    ) && mouse.dwExtraInfo != MAGIC
+        && mouse.flags & LLMHF_INJECTED == 0
+}
+
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        let mouse = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        if mouse_resets_buffer(wparam.0 as u32, mouse) {
+            if let Some(shared) = SHARED.get() {
+                let _ = shared.tx.send(KeyEvent {
+                    kind: KeyKind::Reset,
+                    down: true,
+                    injected: false,
+                });
+            }
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 impl crate::KeyCapture for WinCapture {
     fn run(&mut self, tx: Sender<KeyEvent>) -> Result<()> {
-        let _ = SHARED.set(Shared {
-            tx,
-            hotkey: self.hotkey.clone(),
-            intercept: self.intercept.clone(),
-        });
-
         unsafe {
             let hmod = GetModuleHandleW(None)?;
+            let _focus_hooks = FocusHooks::install()?;
             let hook =
                 SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), Some(HINSTANCE(hmod.0)), 0)?;
+            let mouse_hook = match SetWindowsHookExW(
+                WH_MOUSE_LL,
+                Some(mouse_hook_proc),
+                Some(HINSTANCE(hmod.0)),
+                0,
+            ) {
+                Ok(hook) => hook,
+                Err(error) => {
+                    let _ = UnhookWindowsHookEx(hook);
+                    return Err(error.into());
+                }
+            };
+
+            // Publish the sender only after setup succeeds. A failed hook
+            // installation must close the input channel and stop the engine.
+            let _ = SHARED.set(Shared {
+                tx,
+                hotkey: self.hotkey.clone(),
+                intercept: self.intercept.clone(),
+            });
 
             let mut msg = MSG::default();
             loop {
@@ -299,6 +397,7 @@ impl crate::KeyCapture for WinCapture {
             }
 
             let _ = UnhookWindowsHookEx(hook);
+            let _ = UnhookWindowsHookEx(mouse_hook);
         }
         Ok(())
     }
@@ -307,6 +406,42 @@ impl crate::KeyCapture for WinCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_mouse_clicks_invalidate_the_word() {
+        for message in [
+            WM_LBUTTONDOWN,
+            WM_RBUTTONDOWN,
+            WM_MBUTTONDOWN,
+            WM_XBUTTONDOWN,
+        ] {
+            assert!(mouse_resets_buffer(message, &MSLLHOOKSTRUCT::default()));
+        }
+    }
+
+    #[test]
+    fn mouse_motion_scroll_and_release_keep_the_word() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        };
+        for message in [WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_LBUTTONUP] {
+            assert!(!mouse_resets_buffer(message, &MSLLHOOKSTRUCT::default()));
+        }
+    }
+
+    #[test]
+    fn injected_mouse_clicks_keep_the_word() {
+        let injected = MSLLHOOKSTRUCT {
+            flags: LLMHF_INJECTED,
+            ..Default::default()
+        };
+        assert!(!mouse_resets_buffer(WM_LBUTTONDOWN, &injected));
+        let tagged = MSLLHOOKSTRUCT {
+            dwExtraInfo: MAGIC,
+            ..Default::default()
+        };
+        assert!(!mouse_resets_buffer(WM_LBUTTONDOWN, &tagged));
+    }
 
     #[test]
     fn injected_flag_suppresses_event_when_extra_info_is_lost() {

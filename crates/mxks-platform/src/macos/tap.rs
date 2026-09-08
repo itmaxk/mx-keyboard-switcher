@@ -114,11 +114,30 @@ impl crate::KeyCapture for MacCapture {
             CGEventTapLocation::HID,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::ListenOnly,
-            vec![CGEventType::KeyDown],
+            vec![
+                CGEventType::KeyDown,
+                CGEventType::LeftMouseDown,
+                CGEventType::RightMouseDown,
+                CGEventType::OtherMouseDown,
+            ],
             move |_proxy, etype, event| {
-                if matches!(etype, CGEventType::KeyDown)
-                    && event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) != MAGIC
-                {
+                // Apply the same injection marker to keyboard and mouse input.
+                // Scroll and motion events are deliberately absent from the tap.
+                if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == MAGIC {
+                    return None;
+                }
+                if matches!(
+                    etype,
+                    CGEventType::LeftMouseDown
+                        | CGEventType::RightMouseDown
+                        | CGEventType::OtherMouseDown
+                ) {
+                    let _ = tx.send(KeyEvent {
+                        kind: KeyKind::Reset,
+                        down: true,
+                        injected: false,
+                    });
+                } else if matches!(etype, CGEventType::KeyDown) {
                     let keycode =
                         event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                     let m = mods(event.get_flags());

@@ -14,6 +14,7 @@ pub struct Config {
     pub terminals: Terminals,
     pub dictionary: Dictionary,
     pub autocomplete: Autocomplete,
+    pub logging: Logging,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,7 +41,7 @@ pub struct Detection {
     pub threshold: f32,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Exclusions {
     /// App-name substrings where the switcher is fully off — no automatic
@@ -53,6 +54,19 @@ pub struct Exclusions {
     pub manual_only: Vec<String>,
     /// Typed forms that must never be auto-corrected.
     pub words: Vec<String>,
+}
+
+impl Default for Exclusions {
+    fn default() -> Self {
+        Self {
+            apps: ["keepassxc", "1password", "bitwarden"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            manual_only: Vec::new(),
+            words: Vec::new(),
+        }
+    }
 }
 
 /// Terminals get their own tier: manual-only by default (shell commands must not
@@ -90,6 +104,15 @@ pub struct Autocomplete {
     pub min_prefix: usize,
     /// Minimum letters the completion must add to be worth showing.
     pub min_remainder: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Logging {
+    /// Whether diagnostic events are written to a file.
+    pub enabled: bool,
+    /// User-selected log directory. Empty means the platform default.
+    pub directory: String,
 }
 
 impl Default for General {
@@ -140,6 +163,16 @@ impl Default for Terminals {
                 "xfce4-terminal",
                 "tilix",
                 "wezterm",
+                "com.apple.terminal",
+                "com.googlecode.iterm2",
+                "com.mitchellh.ghostty",
+                "windowsterminal",
+                "powershell",
+                "pwsh",
+                "cmd.exe",
+                "conhost",
+                "openconsole",
+                "mintty",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -175,6 +208,12 @@ convert_last_word = "Pause"
 # Confidence margin required to auto-correct. Higher = fewer false positives.
 threshold = 3.0
 
+[logging]
+# Diagnostic file logging is opt-in. Open or choose its folder from the tray.
+enabled = false
+# Empty uses the platform default; use the tray menu to choose another folder.
+directory = ""
+
 [exclusions]
 # App-name substrings (WM_CLASS, lowercased) where the switcher is FULLY off —
 # no automatic correction/suggestions and no manual hotkey (password managers).
@@ -187,7 +226,7 @@ words = []
 
 [terminals]
 # App-name substrings (WM_CLASS, lowercased) treated as terminals.
-apps = ["ptyxis", "gnome-terminal", "konsole", "xterm", "alacritty", "kitty", "terminator", "xfce4-terminal", "tilix", "wezterm"]
+apps = ["ptyxis", "gnome-terminal", "konsole", "xterm", "alacritty", "kitty", "terminator", "xfce4-terminal", "tilix", "wezterm", "com.apple.terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty", "windowsterminal", "powershell", "pwsh", "cmd.exe", "conhost", "openconsole", "mintty"]
 # false (default): manual-only — auto-correct and suggestions are OFF (shell
 #   commands are never rewritten), but the Pause hotkey still converts on demand.
 # true: full auto, like any other app (uses accept_key below for suggestions).
@@ -221,6 +260,8 @@ mod tests {
         let c = Config::default();
         assert!(c.general.autocorrect);
         assert_eq!(c.hotkeys.convert_last_word, "Pause");
+        assert!(!c.logging.enabled);
+        assert!(c.logging.directory.is_empty());
     }
 
     #[test]
@@ -228,6 +269,18 @@ mod tests {
         let c = Config::from_toml("").unwrap();
         assert!(c.general.autocorrect);
         assert_eq!(c.general.min_word_len, 3);
+    }
+
+    #[test]
+    fn logging_section_is_opt_in_and_accepts_a_directory() {
+        let defaulted = Config::from_toml("[logging]\n").unwrap();
+        assert!(!defaulted.logging.enabled);
+        assert!(defaulted.logging.directory.is_empty());
+
+        let configured =
+            Config::from_toml("[logging]\nenabled = true\ndirectory = \"/tmp/mxks\"\n").unwrap();
+        assert!(configured.logging.enabled);
+        assert_eq!(configured.logging.directory, "/tmp/mxks");
     }
 
     #[test]
@@ -241,6 +294,30 @@ mod tests {
         assert!(c.autocomplete.enabled);
         assert_eq!(c.autocomplete.accept_key, "Tab");
         assert_eq!(c.autocomplete.min_prefix, 3);
+    }
+
+    #[test]
+    fn first_run_defaults_match_the_generated_config() {
+        let mut defaults = Config::default();
+        let mut template = Config::from_toml(DEFAULT_TEMPLATE).unwrap();
+        // Terminal matching is order-independent.
+        defaults.terminals.apps.sort();
+        template.terminals.apps.sort();
+        assert_eq!(
+            toml::Value::try_from(defaults).unwrap(),
+            toml::Value::try_from(template).unwrap()
+        );
+    }
+
+    #[test]
+    fn password_manager_exclusions_default_but_can_be_overridden() {
+        let partial = Config::from_toml("[exclusions]\nwords = [\"example\"]\n").unwrap();
+        assert_eq!(
+            partial.exclusions.apps,
+            ["keepassxc", "1password", "bitwarden"]
+        );
+        let explicit = Config::from_toml("[exclusions]\napps = []\n").unwrap();
+        assert!(explicit.exclusions.apps.is_empty());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! running X server with `ru` and `us` layouts. Run explicitly with:
 //!
 //! ```sh
-//! cargo test -p mxks-platform --test x11_live -- --ignored --test-threads=1
+//! scripts/run-x11-live-tests.sh
 //! ```
 #![cfg(target_os = "linux")]
 

@@ -9,7 +9,7 @@ use crate::convert::Stroke;
 use crate::layout::Lang;
 
 /// Maximum keystrokes tracked in a single word. Longer words are simply not
-/// eligible for correction (they overflow and reset).
+/// eligible for correction (tracking resumes at the next boundary or reset).
 const MAX_WORD: usize = 64;
 
 /// What a single fed event means for word tracking.
@@ -41,6 +41,9 @@ pub struct WordBuffer {
     lang: Lang,
     /// Layout at the moment the current word's first key was pressed.
     word_start_lang: Lang,
+    /// Once a word overflows, its untracked prefix makes every suffix unsafe
+    /// to correct. Resume tracking only after a boundary or explicit reset.
+    overflowed: bool,
 }
 
 impl WordBuffer {
@@ -49,6 +52,7 @@ impl WordBuffer {
             keys: Vec::with_capacity(MAX_WORD),
             lang,
             word_start_lang: lang,
+            overflowed: false,
         }
     }
 
@@ -78,11 +82,15 @@ impl WordBuffer {
     pub fn feed(&mut self, event: Event) -> Option<Word> {
         match event {
             Event::Letter(stroke) => {
+                if self.overflowed {
+                    return None;
+                }
                 if self.keys.is_empty() {
                     self.word_start_lang = self.lang;
                 }
                 if self.keys.len() >= MAX_WORD {
                     self.keys.clear();
+                    self.overflowed = true;
                 } else {
                     self.keys.push(stroke);
                 }
@@ -93,6 +101,7 @@ impl WordBuffer {
                 None
             }
             Event::Boundary => {
+                self.overflowed = false;
                 if self.keys.is_empty() {
                     None
                 } else {
@@ -104,7 +113,7 @@ impl WordBuffer {
                 }
             }
             Event::Reset => {
-                self.keys.clear();
+                self.clear();
                 None
             }
         }
@@ -113,6 +122,7 @@ impl WordBuffer {
     /// Clear the current word (e.g. after a manual conversion consumes it).
     pub fn clear(&mut self) {
         self.keys.clear();
+        self.overflowed = false;
     }
 }
 
@@ -169,5 +179,65 @@ mod tests {
         b.set_lang(Lang::Ru); // user switches mid-word; word keeps its start lang
         let word = b.feed(Event::Boundary).unwrap();
         assert_eq!(word.lang, Lang::En);
+    }
+
+    #[test]
+    fn maximum_length_word_is_still_eligible() {
+        let mut b = WordBuffer::new(Lang::En);
+        for _ in 0..MAX_WORD {
+            b.feed(letter(A));
+        }
+        assert_eq!(b.feed(Event::Boundary).unwrap().keys.len(), MAX_WORD);
+    }
+
+    #[test]
+    fn overflow_does_not_expose_a_correctable_suffix() {
+        let mut b = WordBuffer::new(Lang::En);
+        for _ in 0..MAX_WORD + 1 {
+            b.feed(letter(A));
+        }
+        // This suffix would otherwise be corrected from "ghbdtn" to "привет"
+        // inside a longer token, despite the maximum-word-length guard.
+        for key in [G, H, B, D, T, N] {
+            b.feed(letter(key));
+        }
+        assert!(b.is_empty());
+        assert!(b.current().is_none());
+        assert!(b.feed(Event::Boundary).is_none());
+
+        b.set_lang(Lang::Ru);
+        b.feed(letter(H));
+        let next = b.feed(Event::Boundary).unwrap();
+        assert_eq!(next.keys.len(), 1);
+        assert_eq!(next.lang, Lang::Ru);
+    }
+
+    #[test]
+    fn backspace_cannot_reenable_an_untracked_word() {
+        let mut b = WordBuffer::new(Lang::En);
+        for _ in 0..MAX_WORD * 3 {
+            b.feed(letter(A));
+        }
+        b.feed(Event::Backspace);
+        b.feed(letter(H));
+        assert!(b.current().is_none());
+        assert!(b.feed(Event::Boundary).is_none());
+    }
+
+    #[test]
+    fn explicit_reset_or_clear_resumes_tracking_after_overflow() {
+        for reset in [true, false] {
+            let mut b = WordBuffer::new(Lang::En);
+            for _ in 0..MAX_WORD + 1 {
+                b.feed(letter(A));
+            }
+            if reset {
+                b.feed(Event::Reset);
+            } else {
+                b.clear();
+            }
+            b.feed(letter(H));
+            assert_eq!(b.feed(Event::Boundary).unwrap().keys.len(), 1);
+        }
     }
 }

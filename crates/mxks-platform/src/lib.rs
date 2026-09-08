@@ -55,9 +55,19 @@ pub trait LayoutSwitcher: Send {
     fn switch_to(&mut self, lang: Lang) -> Result<()>;
 }
 
-/// Best-effort information about the focused input, used to avoid correcting in
-/// password fields. Implementations may always return `false`.
+/// Native input identity, application classification, and password-field hints.
+/// Backends without identity polling can deliver Reset through key capture.
 pub trait FocusInfo: Send {
+    /// Whether the engine should also check focus while idle (100 ms interval).
+    /// Linux already delivers focus notifications through the capture channel.
+    fn monitors_focus(&self) -> bool {
+        false
+    }
+    /// Refresh the native input identity before processing a key. A backend
+    /// that cannot resolve focus must report Unavailable to prevent stale edits.
+    fn poll_focus(&mut self) -> FocusState {
+        FocusState::Unchanged
+    }
     fn is_password_field(&self) -> bool {
         false
     }
@@ -65,6 +75,13 @@ pub trait FocusInfo: Send {
     fn focused_app(&self) -> Option<String> {
         None
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusState {
+    Unchanged,
+    Changed,
+    Unavailable,
 }
 
 /// Command for the suggestion overlay thread.
@@ -269,6 +286,11 @@ pub struct HotkeyHandle {
 }
 
 impl HotkeyHandle {
+    /// Cancel an assignment without changing either key binding.
+    pub fn cancel_capture(&self) {
+        self.capturing.store(CAPTURE_NONE, Ordering::SeqCst);
+    }
+
     /// Arm capture: the next keypress is assigned to `target`.
     pub fn begin_capture(&self, target: CaptureTarget) {
         let code = match target {
@@ -312,6 +334,34 @@ pub fn hotkey_channel(initial: HotkeySpec) -> (HotkeyControl, HotkeyHandle) {
 /// unsupported (e.g. a Wayland session on Linux).
 pub fn backend(hotkey: HotkeySpec) -> Result<Backend> {
     imp::backend(hotkey)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_key_capture_keeps_binding_and_can_be_rearmed() {
+        let initial = HotkeySpec::default();
+        let replacement = crate::default_accept();
+        let (control, handle) = hotkey_channel(initial.clone());
+        for target in [CaptureTarget::ConvertHotkey, CaptureTarget::AcceptKey] {
+            handle.begin_capture(target);
+            assert!(control.is_capturing());
+            handle.cancel_capture();
+            assert!(!control.is_capturing());
+            control.record(replacement.clone());
+            assert_eq!(control.current(), initial);
+            assert!(handle.updates().try_recv().is_err());
+        }
+        handle.begin_capture(CaptureTarget::ConvertHotkey);
+        control.record(replacement.clone());
+        assert_eq!(control.current(), replacement);
+        assert_eq!(
+            handle.updates().try_recv().unwrap().0,
+            CaptureTarget::ConvertHotkey
+        );
+    }
 }
 
 // --- Per-OS backend selection ------------------------------------------------
