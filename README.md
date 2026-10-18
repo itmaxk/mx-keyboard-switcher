@@ -91,10 +91,20 @@ powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/itm
 
 Flags:
 
-- Linux/macOS: `sh -s -- --no-autostart` · `--from-source` · `--version vX.Y.Z`
+- Linux/macOS: `sh -s -- --no-autostart` · `--from-source` · `--version vX.Y.Z` · `--no-system-config` (Linux)
 - Windows (piped with flags): `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/itmaxk/mx-keyboard-switcher/main/scripts/install.ps1))) -NoAutostart`
 
 If there is no release asset for your platform yet, the script builds from source (needs `cargo`).
+
+On Linux the installer also checks the keyboard setup (skip with `--no-system-config`):
+
+- it warns if the X session lacks the `us` or `ru` layout;
+- on an **xrdp** server it offers to patch `/etc/xrdp/xrdp_keyboard.ini` (with
+  `sudo`, keeping a `.bak`). xrdp reloads the keymap with only the client's layout
+  on every RDP connect, which drops the second layout and the switch shortcut until
+  the next restart. The patch maps us/ru clients to `us,ru` and appends a
+  `[rdp_keyboard_mxks]` section with the shortcut (your current `grp:` option, or
+  `grp:alt_shift_toggle`). The diff is shown before anything is changed.
 
 
 Requires a recent Rust toolchain (`rustup`, stable).

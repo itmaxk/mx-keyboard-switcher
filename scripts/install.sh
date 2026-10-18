@@ -7,8 +7,13 @@ REPO="itmaxk/mx-keyboard-switcher"
 BIN="mx-keyboard-switcher"
 INSTALL_DIR="${HOME}/.local/bin"
 
+XRDP_KEYBOARD_INI="/etc/xrdp/xrdp_keyboard.ini"
+# Layout-switch shortcut written for xrdp when the session has none configured.
+DEFAULT_GRP_OPTION="grp:alt_shift_toggle"
+
 NO_AUTOSTART=0
 FROM_SOURCE=0
+NO_SYSTEM_CONFIG=0
 VERSION=""
 
 usage() {
@@ -18,6 +23,9 @@ Usage: install.sh [options]
 Options:
   --no-autostart   Install only; do not configure or start autostart
   --from-source    Skip prebuilt download; build with cargo
+  --no-system-config
+                   Linux: skip the keyboard layout checks and do not offer
+                   to fix the xrdp keyboard config
   --version TAG    Install a specific release tag (default: latest)
   --help           Show this help and exit
 EOF
@@ -30,6 +38,9 @@ while [ "$#" -gt 0 ]; do
       ;;
     --from-source)
       FROM_SOURCE=1
+      ;;
+    --no-system-config)
+      NO_SYSTEM_CONFIG=1
       ;;
     --version)
       if [ "$#" -lt 2 ]; then
@@ -184,6 +195,139 @@ EOF
   log "Autostart desktop entry: ${desktop_file}"
 }
 
+# Ask a yes/no question on the terminal (stdin may be the `curl | sh` pipe).
+# Defaults to "no" when there is no terminal to ask on.
+confirm() {
+  (exec </dev/tty) 2>/dev/null || return 1
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r answer </dev/tty || return 1
+  case "$answer" in
+    [yY]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Layout list and group-switch option of the running X session.
+read_session_keyboard() {
+  SESSION_LAYOUTS=""
+  SESSION_GRP=""
+  [ -n "${DISPLAY:-}" ] && command -v setxkbmap >/dev/null 2>&1 || return 0
+  query="$(setxkbmap -query 2>/dev/null)" || return 0
+  SESSION_LAYOUTS="$(printf '%s\n' "$query" | sed -n 's/^layout:[[:space:]]*//p')"
+  SESSION_GRP="$(printf '%s\n' "$query" | sed -n 's/^options:[[:space:]]*//p' |
+    tr ',' '\n' | grep '^grp:' | head -n 1)" || true
+}
+
+check_session_layouts() {
+  [ -n "$SESSION_LAYOUTS" ] || return 0
+  has_us=0
+  has_ru=0
+  case ",${SESSION_LAYOUTS}," in *,us,*) has_us=1 ;; esac
+  case ",${SESSION_LAYOUTS}," in *,ru,*) has_ru=1 ;; esac
+  [ "$has_us" -eq 1 ] && [ "$has_ru" -eq 1 ] && return 0
+  warn "the X keyboard layouts are '${SESSION_LAYOUTS}', but MX Keyboard Switcher needs both us and ru."
+  warn "add the missing layout in your desktop keyboard settings (or: setxkbmap -layout us,ru)."
+}
+
+# Print the xrdp keyboard config patched so that every RDP (re)connect loads
+# both us and ru. xrdp replaces the X keymap with the client's single layout on
+# each connect, which silently drops the second layout and the switch shortcut.
+#
+# - every layouts map that sends a us or ru client to a single layout is
+#   pointed at us,ru instead;
+# - a [rdp_keyboard_mxks] section is appended for standard PC keyboards
+#   (type 4; xrdp reads subtype 0 as 1) carrying the switch shortcut. xrdp
+#   ignores model/options in [default], and a later section with the same
+#   keyboard_type resets an earlier match, so it must be the last section.
+patch_xrdp_keyboard() {
+  awk -v grp="$2" '
+    function section_name(line) {
+      sub(/^[[:space:]]*\[/, "", line)
+      sub(/\][[:space:]]*$/, "", line)
+      return line
+    }
+    function value(line) {
+      sub(/^[^=]*=[[:space:]]*/, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      return line
+    }
+    { sub(/\r$/, "") }
+    NR == FNR {
+      if ($0 ~ /^[[:space:]]*\[/) {
+        sec = section_name($0)
+        if (sec == "rdp_keyboard_mxks") ours = 1
+      } else if ($0 ~ /^[[:space:]]*layouts_map[[:space:]]*=/) {
+        maps[value($0)] = 1
+      }
+      next
+    }
+    /^[[:space:]]*\[/ { sec = section_name($0) }
+    sec in maps && /^[[:space:]]*rdp_layout_(us|ru)[[:space:]]*=/ {
+      v = value($0)
+      if (v == "us" || v == "ru") {
+        key = $0
+        sub(/[[:space:]]*=.*/, "", key)
+        $0 = key "=us,ru"
+      }
+    }
+    { print }
+    END {
+      if (!ours) {
+        print ""
+        print "; Added by mx-keyboard-switcher: keep both us and ru (and the layout"
+        print "; switch shortcut) after every RDP connect. Must stay the last section."
+        print "[rdp_keyboard_mxks]"
+        print "keyboard_type=4"
+        print "keyboard_subtype=1"
+        print "model=pc105"
+        print "options=" grp
+        print "rdp_layouts=default_rdp_layouts"
+        print "layouts_map=default_layouts_map"
+      }
+    }
+  ' "$1" "$1"
+}
+
+check_xrdp_keyboard() {
+  [ -f "$XRDP_KEYBOARD_INI" ] || return 0
+  if ! command -v diff >/dev/null 2>&1; then
+    warn "xrdp detected but 'diff' is missing; skipped the xrdp keyboard check."
+    return 0
+  fi
+  grp="${SESSION_GRP:-$DEFAULT_GRP_OPTION}"
+  patched="$(mktemp)"
+  patch_xrdp_keyboard "$XRDP_KEYBOARD_INI" "$grp" >"$patched"
+  if diff -q "$XRDP_KEYBOARD_INI" "$patched" >/dev/null; then
+    rm -f "$patched"
+    log "xrdp keyboard config already keeps us,ru."
+    return 0
+  fi
+
+  log ""
+  log "xrdp is installed. On every RDP connect it reloads the keyboard with only"
+  log "the client's layout, so the us/ru switch stops working until restart."
+  log "Proposed change to ${XRDP_KEYBOARD_INI} (switch shortcut: ${grp}):"
+  diff -u "$XRDP_KEYBOARD_INI" "$patched" || true
+  if confirm "Apply it with sudo (a .bak copy is kept)?"; then
+    # cp onto the existing file keeps its owner and mode.
+    if sudo cp -p "$XRDP_KEYBOARD_INI" "${XRDP_KEYBOARD_INI}.bak" &&
+      sudo cp "$patched" "$XRDP_KEYBOARD_INI"; then
+      log "Updated ${XRDP_KEYBOARD_INI}; reconnect RDP to apply."
+    else
+      warn "could not update ${XRDP_KEYBOARD_INI}; the layout switch may break after RDP reconnects."
+    fi
+  else
+    log "Left ${XRDP_KEYBOARD_INI} unchanged. To apply later, re-run the installer in a terminal."
+  fi
+  rm -f "$patched"
+}
+
+configure_linux_keyboard() {
+  read_session_keyboard
+  check_session_layouts
+  check_xrdp_keyboard
+}
+
 write_macos_autostart() {
   plist_dir="${HOME}/Library/LaunchAgents"
   plist_file="${plist_dir}/com.itmaxk.mx-keyboard-switcher.plist"
@@ -298,6 +442,14 @@ main() {
   fi
 
   install_binary
+
+  if [ "$(uname -s)" = "Linux" ]; then
+    if [ "$NO_SYSTEM_CONFIG" -eq 0 ]; then
+      configure_linux_keyboard
+    else
+      log "Skipped keyboard layout checks (--no-system-config)."
+    fi
+  fi
 
   if [ "$NO_AUTOSTART" -eq 0 ]; then
     configure_autostart
