@@ -88,6 +88,8 @@ const XK_SCROLL_LOCK: u32 = 0xff14;
 const XK_CONTROL_L: u32 = 0xffe3;
 const XK_G: u32 = 0x0067;
 const XK_RIGHT: u32 = 0xff53;
+const XK_A: u32 = 0x0061;
+const XK_CYRILLIC_EF: u32 = 0x06c6;
 
 /// These tests inject raw XTEST events that the X server delivers to whatever
 /// window currently has focus. On a shared desktop display that means phantom
@@ -242,6 +244,62 @@ fn layout_switch_round_trips() {
 
     // Leave the system on English.
     b.layout.switch_to(Lang::En).ok();
+}
+
+/// Run `setxkbmap -layout <layouts>` on the isolated display.
+fn set_layouts(layouts: &str) {
+    let status = std::process::Command::new("setxkbmap")
+        .args(["-layout", layouts])
+        .status()
+        .expect("run setxkbmap");
+    assert!(status.success(), "setxkbmap -layout {layouts} failed");
+}
+
+/// Base keysym the A key produces in the active XKB group, read independently
+/// of the backend so a stale group classification cannot mask itself.
+fn active_a_keysym() -> u32 {
+    use x11rb::protocol::xkb::{self, ConnectionExt as _};
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+    let (conn, _) = RustConnection::connect(None).unwrap();
+    conn.xkb_use_extension(1, 0).unwrap().reply().unwrap();
+    let state = conn
+        .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
+        .unwrap()
+        .reply()
+        .unwrap();
+    let group: u8 = state.group.into();
+    let map = conn.get_keyboard_mapping(38, 1).unwrap().reply().unwrap(); // A
+    map.keysyms[group as usize * 2]
+}
+
+/// The keymap can be replaced while the daemon runs (xrdp reloads it on every
+/// reconnect). Switching must follow the new group order instead of the one
+/// seen at startup.
+#[test]
+#[ignore = "requires a live X server with ru/us layouts"]
+fn layout_switch_follows_runtime_keymap_change() {
+    require_isolated_display();
+    let mut b = backend(HotkeySpec::default()).expect("backend");
+
+    set_layouts("ru,us");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for lang in [Lang::En, Lang::Ru, Lang::En] {
+            b.layout.switch_to(lang).expect("switch");
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(b.layout.current().expect("read"), Some(lang));
+            let expected = match lang {
+                Lang::En => XK_A,
+                Lang::Ru => XK_CYRILLIC_EF,
+            };
+            assert_eq!(active_a_keysym(), expected, "{lang:?} is not really active");
+        }
+    }));
+    // Restore the layout order the other tests expect.
+    set_layouts("us,ru");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[test]
