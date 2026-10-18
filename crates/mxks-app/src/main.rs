@@ -57,12 +57,66 @@ fn acquire_named_instance(name: &HSTRING) -> Result<Option<InstanceGuard>> {
 }
 
 fn main() {
+    // Acquire before logging or starting any capture/tray threads.
+    #[cfg(target_os = "linux")]
+    let _instance_guard = match acquire_linux_instance() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return,
+        Err(error) => {
+            report_fatal(&error);
+            std::process::exit(1);
+        }
+    };
+
     let config = config_io::load();
     let log_controller = logging::init(&config.logging);
     if let Err(error) = run(config, log_controller) {
         tracing::error!("fatal: {error:#}");
         report_fatal(&error);
         std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_instance() -> Result<Option<std::fs::File>> {
+    let directory = dirs::config_dir()
+        .context("no config directory")?
+        .join("mx-keyboard-switcher");
+    std::fs::create_dir_all(&directory).context("create instance lock directory")?;
+    lock_instance_file(&directory.join("instance.lock"))
+}
+
+#[cfg(target_os = "linux")]
+fn lock_instance_file(path: &Path) -> Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .context("open instance lock")?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(anyhow::anyhow!("lock instance file: {error}")),
+    }
+    // Keep the file in place: unlinking it would let another process lock a
+    // different inode. The OS releases the lock even if the process crashes.
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_instance_tests {
+    use super::*;
+
+    #[test]
+    fn second_instance_is_rejected_and_lock_is_released_on_exit() {
+        let path = std::env::temp_dir().join(format!("mxks-instance-test-{}", std::process::id()));
+        let first = lock_instance_file(&path).unwrap().unwrap();
+        assert!(lock_instance_file(&path).unwrap().is_none());
+        drop(first);
+        let next = lock_instance_file(&path).unwrap().unwrap();
+        drop(next);
+        std::fs::remove_file(path).unwrap();
     }
 }
 
