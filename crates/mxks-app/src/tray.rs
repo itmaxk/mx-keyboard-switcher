@@ -6,19 +6,79 @@
 
 use crossbeam_channel::{Receiver, Sender};
 
+#[cfg(feature = "tray")]
+use mxks_core::layout::Lang;
+
 use crate::engine::{Command, Status};
 
+/// Embedded 32x32 tray icons for EN, RU and any other layout; the active
+/// layout's key is drawn in front. The macOS menu bar renders template images
+/// from alpha alone, so it gets variants with the letters cut out.
+#[cfg(all(feature = "tray", not(target_os = "macos")))]
+const TRAY_PNGS: [&[u8]; 3] = [
+    include_bytes!("../assets/tray-en.png"),
+    include_bytes!("../assets/tray-ru.png"),
+    include_bytes!("../assets/tray-none.png"),
+];
+#[cfg(all(feature = "tray", target_os = "macos"))]
+const TRAY_PNGS: [&[u8]; 3] = [
+    include_bytes!("../assets/tray-en-template.png"),
+    include_bytes!("../assets/tray-ru-template.png"),
+    include_bytes!("../assets/tray-none-template.png"),
+];
+
+/// One tray icon per layout state, converted once for the tray backend.
 #[cfg(feature = "tray")]
-fn decode_tray_icon() -> anyhow::Result<(Vec<u8>, u32, u32)> {
+struct LayoutIcons<T> {
+    en: T,
+    ru: T,
+    other: T,
+}
+
+#[cfg(feature = "tray")]
+impl<T> LayoutIcons<T> {
+    fn get(&self, layout: Option<Lang>) -> &T {
+        match layout {
+            Some(Lang::En) => &self.en,
+            Some(Lang::Ru) => &self.ru,
+            None => &self.other,
+        }
+    }
+}
+
+#[cfg(feature = "tray")]
+fn decode_tray_icons<T>(
+    mut convert: impl FnMut(Vec<u8>, u32, u32) -> anyhow::Result<T>,
+) -> anyhow::Result<LayoutIcons<T>> {
+    let [en, ru, other] = TRAY_PNGS;
+    let mut load = |png: &[u8]| {
+        let (rgba, width, height) = decode_tray_icon(png)?;
+        convert(rgba, width, height)
+    };
+    Ok(LayoutIcons {
+        en: load(en)?,
+        ru: load(ru)?,
+        other: load(other)?,
+    })
+}
+
+#[cfg(feature = "tray")]
+fn layout_text(layout: Option<Lang>) -> &'static str {
+    match layout {
+        Some(Lang::En) => "EN layout",
+        Some(Lang::Ru) => "RU layout",
+        None => "Other layout",
+    }
+}
+
+#[cfg(feature = "tray")]
+fn decode_tray_icon(png: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
     use anyhow::{bail, Context};
     use image::ImageFormat;
 
-    let image = image::load_from_memory_with_format(
-        include_bytes!("../assets/icon-tray.png"),
-        ImageFormat::Png,
-    )
-    .context("failed to decode embedded tray icon")?
-    .into_rgba8();
+    let image = image::load_from_memory_with_format(png, ImageFormat::Png)
+        .context("failed to decode embedded tray icon")?
+        .into_rgba8();
     let (width, height) = image.dimensions();
     if (width, height) != (32, 32) {
         bail!("embedded tray icon must be 32x32, got {width}x{height}");
@@ -91,7 +151,7 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
     struct AppTray {
         cmd_tx: Sender<Command>,
         status: Status,
-        icon_pixmap: Vec<Icon>,
+        icons: LayoutIcons<Vec<Icon>>,
     }
 
     impl Tray for AppTray {
@@ -104,7 +164,7 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
         }
 
         fn icon_pixmap(&self) -> Vec<Icon> {
-            self.icon_pixmap.clone()
+            self.icons.get(self.status.layout).clone()
         }
 
         fn title(&self) -> String {
@@ -115,9 +175,9 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
             let state = if self.status.enabled { "on" } else { "off" };
             ksni::ToolTip {
                 title: "MX Keyboard Switcher".into(),
-                description: format!("Switching {state}"),
+                description: format!("{} · switching {state}", layout_text(self.status.layout)),
                 icon_name: String::new(),
-                icon_pixmap: self.icon_pixmap.clone(),
+                icon_pixmap: self.icon_pixmap(),
             }
         }
 
@@ -273,26 +333,31 @@ pub fn start(cmd_tx: Sender<Command>, status_rx: Receiver<Status>, initial_statu
         }
     }
 
-    let (mut rgba, width, height) = match decode_tray_icon() {
-        Ok(icon) => icon,
+    let icons = match decode_tray_icons(|mut rgba, width, height| {
+        // SNI pixmaps are ARGB32 in network byte order.
+        let (pixels, remainder) = rgba.as_chunks_mut::<4>();
+        debug_assert!(remainder.is_empty());
+        for pixel in pixels {
+            pixel.rotate_right(1);
+        }
+        Ok(vec![Icon {
+            width: width as i32,
+            height: height as i32,
+            data: rgba,
+        }])
+    }) {
+        Ok(icons) => icons,
         Err(error) => {
             tracing::warn!("tray unavailable ({error:#}); running without a tray icon");
             return;
         }
     };
-    let (pixels, remainder) = rgba.as_chunks_mut::<4>();
-    debug_assert!(remainder.is_empty());
-    for pixel in pixels {
-        pixel.rotate_right(1);
-    }
+    // ksni compares the pixmap after each update and signals NewIcon when the
+    // layout changed it.
     let tray = AppTray {
         cmd_tx,
         status: initial_status,
-        icon_pixmap: vec![Icon {
-            width: width as i32,
-            height: height as i32,
-            data: rgba,
-        }],
+        icons,
     };
     let handle = match tray.spawn() {
         Ok(handle) => handle,
@@ -318,7 +383,7 @@ mod native {
     use winit::application::ApplicationHandler;
     use winit::event_loop::{ActiveEventLoop, EventLoop};
 
-    use super::{decode_tray_icon, Command, MenuView, Status};
+    use super::{decode_tray_icons, layout_text, Command, Lang, LayoutIcons, MenuView, Status};
 
     const TOGGLE_ENABLED: &str = "toggle-enabled";
     const TOGGLE_AUTOCORRECT: &str = "toggle-autocorrect";
@@ -377,8 +442,35 @@ mod native {
     }
 
     struct UiState {
-        _tray: TrayIcon,
+        tray: TrayIcon,
         items: MenuItems,
+        icons: LayoutIcons<tray_icon::Icon>,
+        layout: Option<Lang>,
+    }
+
+    impl UiState {
+        /// Swap the icon so the active layout's key is in front.
+        fn show_layout(&mut self, layout: Option<Lang>) {
+            if layout == self.layout {
+                return;
+            }
+            self.layout = layout;
+            let icon = Some(self.icons.get(layout).clone());
+            #[cfg(target_os = "macos")]
+            let result = self.tray.set_icon_with_as_template(icon, true);
+            #[cfg(not(target_os = "macos"))]
+            let result = self.tray.set_icon(icon);
+            if let Err(error) = result {
+                tracing::warn!("could not update tray icon: {error}");
+            }
+            if let Err(error) = self.tray.set_tooltip(Some(tooltip(layout))) {
+                tracing::warn!("could not update tray tooltip: {error}");
+            }
+        }
+    }
+
+    fn tooltip(layout: Option<Lang>) -> String {
+        format!("MX Keyboard Switcher · {}", layout_text(layout))
     }
 
     pub(super) struct NativeApp {
@@ -491,21 +583,25 @@ mod native {
             ])
             .context("failed to build tray menu")?;
 
-            let (rgba, width, height) = decode_tray_icon()?;
-            let icon = tray_icon::Icon::from_rgba(rgba, width, height)
-                .map_err(|error| anyhow!("failed to create tray icon: {error}"))?;
+            let icons = decode_tray_icons(|rgba, width, height| {
+                tray_icon::Icon::from_rgba(rgba, width, height)
+                    .map_err(|error| anyhow!("failed to create tray icon: {error}"))
+            })?;
+            let layout = self.status.layout;
             let builder = TrayIconBuilder::new()
                 .with_id("mx-keyboard-switcher")
                 .with_menu(Box::new(menu))
-                .with_icon(icon)
-                .with_tooltip("MX Keyboard Switcher")
+                .with_icon(icons.get(layout).clone())
+                .with_tooltip(tooltip(layout))
                 .with_menu_on_left_click(true);
             #[cfg(target_os = "macos")]
             let builder = builder.with_icon_as_template(true);
             let tray = builder.build().context("failed to create native tray")?;
 
             Ok(UiState {
-                _tray: tray,
+                tray,
+                icons,
+                layout,
                 items: MenuItems {
                     enabled,
                     autocorrect,
@@ -564,8 +660,9 @@ mod native {
                 }
                 UserEvent::Status(status) => {
                     self.status = status;
-                    if let Some(ui) = &self.ui {
+                    if let Some(ui) = &mut self.ui {
                         ui.items.update(&MenuView::from(&self.status));
+                        ui.show_layout(self.status.layout);
                     }
                 }
                 UserEvent::EngineStopped => event_loop.exit(),
@@ -682,8 +779,9 @@ pub fn start(_cmd_tx: Sender<Command>, _status_rx: Receiver<Status>, _initial_st
 }
 #[cfg(all(test, feature = "tray"))]
 mod tests {
-    use super::{decode_tray_icon, MenuView};
+    use super::{decode_tray_icon, decode_tray_icons, LayoutIcons, MenuView};
     use crate::engine::Status;
+    use mxks_core::layout::Lang;
 
     fn status(capturing: bool) -> Status {
         Status {
@@ -698,6 +796,7 @@ mod tests {
             autostart: true,
             logging_enabled: false,
             log_path: std::env::temp_dir().join("mxks.log"),
+            layout: Some(Lang::En),
         }
     }
 
@@ -722,14 +821,42 @@ mod tests {
     }
 
     #[test]
-    fn embedded_icon_is_32x32_rgba() {
-        let (rgba, width, height) = decode_tray_icon().expect("embedded icon");
-        assert_eq!((width, height), (32, 32));
-        assert_eq!(rgba.len(), 32 * 32 * 4);
-        let (pixels, remainder) = rgba.as_chunks::<4>();
-        assert!(remainder.is_empty());
-        assert!(pixels.iter().any(|pixel| pixel[3] == 0));
-        assert!(pixels.iter().any(|pixel| pixel[3] != 0));
+    fn embedded_icons_are_32x32_rgba() {
+        // Both sets, so a broken macOS template also fails on other hosts.
+        let pngs: [&[u8]; 6] = [
+            include_bytes!("../assets/tray-en.png"),
+            include_bytes!("../assets/tray-ru.png"),
+            include_bytes!("../assets/tray-none.png"),
+            include_bytes!("../assets/tray-en-template.png"),
+            include_bytes!("../assets/tray-ru-template.png"),
+            include_bytes!("../assets/tray-none-template.png"),
+        ];
+        for png in pngs {
+            let (rgba, width, height) = decode_tray_icon(png).expect("embedded icon");
+            assert_eq!((width, height), (32, 32));
+            assert_eq!(rgba.len(), 32 * 32 * 4);
+            let (pixels, remainder) = rgba.as_chunks::<4>();
+            assert!(remainder.is_empty());
+            assert!(pixels.iter().any(|pixel| pixel[3] == 0));
+            assert!(pixels.iter().any(|pixel| pixel[3] != 0));
+        }
+    }
+
+    #[test]
+    fn tray_icon_follows_active_layout() {
+        let icons = decode_tray_icons(|rgba, _, _| Ok(rgba)).expect("embedded icons");
+        assert_ne!(icons.get(Some(Lang::En)), icons.get(Some(Lang::Ru)));
+        assert_ne!(icons.get(Some(Lang::En)), icons.get(None));
+        assert_ne!(icons.get(Some(Lang::Ru)), icons.get(None));
+
+        let names = LayoutIcons {
+            en: "en",
+            ru: "ru",
+            other: "other",
+        };
+        assert_eq!(*names.get(Some(Lang::En)), "en");
+        assert_eq!(*names.get(Some(Lang::Ru)), "ru");
+        assert_eq!(*names.get(None), "other");
     }
 }
 

@@ -24,6 +24,10 @@ use crate::usage_io::UsageStore;
 /// cannot type a whole word this fast; a leaked echo replays instantly.
 const AUTOCORRECT_COOLDOWN: Duration = Duration::from_millis(150);
 
+/// How often the tray's layout icon is re-checked. Short enough to follow an
+/// OS-shortcut switch without visible lag; one cheap layout read per tick.
+const LAYOUT_POLL: Duration = Duration::from_millis(250);
+
 /// Apps that forward keyboard input to another machine (RDP/VNC clients, VM
 /// consoles, remote-control tools). The typed text lives on the remote side,
 /// whose layout this daemon can neither read nor switch, so any correction
@@ -120,6 +124,8 @@ pub struct Status {
     pub logging_enabled: bool,
     /// Effective diagnostic log path used by the tray folder picker.
     pub log_path: PathBuf,
+    /// Active system layout for the tray icon; `None` if neither EN nor RU.
+    pub layout: Option<Lang>,
 }
 
 /// The result of the most recent *manual* conversion, kept so the hotkey can
@@ -156,6 +162,10 @@ pub struct Engine {
     last_correction: Option<Instant>,
     /// Broadcasts status changes so the tray can update its menu.
     status_tx: Option<Sender<Status>>,
+    /// Layout last reported to the tray. Polled while a tray listens, because
+    /// the user also switches layouts outside the engine (OS shortcut, per-window
+    /// layouts on Windows).
+    indicated_layout: Option<Lang>,
     /// Full dictionary candidate currently offered to the user.
     suggestion: Option<Suggestion>,
     /// A queued accept from the previous input target must never replay Tab
@@ -183,7 +193,8 @@ impl Engine {
         focus: Box<dyn FocusInfo>,
         hotkey: HotkeyHandle,
     ) -> Self {
-        let active = corrector.current_layout().unwrap_or(Lang::En);
+        let layout = corrector.current_layout();
+        let active = layout.unwrap_or(Lang::En);
         Engine {
             buffer: WordBuffer::new(active),
             config,
@@ -197,6 +208,7 @@ impl Engine {
             toggle: None,
             last_correction: None,
             status_tx: None,
+            indicated_layout: layout,
             suggestion: None,
             discard_stale_accept: false,
             usage: UsageStore::memory(WordUsage::default()),
@@ -261,6 +273,7 @@ impl Engine {
             autostart: crate::autostart::is_enabled(),
             logging_enabled,
             log_path,
+            layout: self.indicated_layout,
         }
     }
 
@@ -283,9 +296,15 @@ impl Engine {
         } else {
             crossbeam_channel::never()
         };
+        let layout_tick = if self.status_tx.is_some() {
+            crossbeam_channel::tick(LAYOUT_POLL)
+        } else {
+            crossbeam_channel::never()
+        };
         loop {
             crossbeam_channel::select! {
                 recv(focus_tick) -> _ => { self.refresh_focus(); },
+                recv(layout_tick) -> _ => self.refresh_layout_indicator(),
                 recv(key_rx) -> msg => match msg {
                     Ok(ev) => self.handle_key(ev),
                     Err(_) => break,
@@ -386,6 +405,15 @@ impl Engine {
                 self.manual_convert();
             }
             KeyKind::Accept => self.on_accept(),
+        }
+    }
+
+    /// Re-read the system layout and tell the tray when it changed.
+    fn refresh_layout_indicator(&mut self) {
+        let layout = self.corrector.current_layout();
+        if layout != self.indicated_layout {
+            self.indicated_layout = layout;
+            self.broadcast_status();
         }
     }
 
@@ -2174,5 +2202,26 @@ mod tests {
             "overlay not hidden after backspace below min_prefix"
         );
         assert!(!icontrol.is_active(), "interception left on");
+    }
+
+    #[test]
+    fn layout_switch_outside_engine_updates_tray_status() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (engine, _overlay_rx, _icontrol, layout) =
+            autocomplete_engine_with_layout(log, Lang::En);
+        let (status_tx, status_rx) = crossbeam_channel::unbounded();
+        let mut engine = engine.with_status_channel(status_tx);
+        assert_eq!(engine.status().layout, Some(Lang::En));
+
+        // Unchanged layout: no status traffic on each poll.
+        engine.refresh_layout_indicator();
+        assert!(status_rx.try_recv().is_err());
+
+        // The user switches with the OS shortcut; the next poll reports it once.
+        *layout.lock().unwrap() = Lang::Ru;
+        engine.refresh_layout_indicator();
+        assert_eq!(status_rx.try_recv().unwrap().layout, Some(Lang::Ru));
+        engine.refresh_layout_indicator();
+        assert!(status_rx.try_recv().is_err());
     }
 }
