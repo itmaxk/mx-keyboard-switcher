@@ -59,17 +59,20 @@ fn acquire_named_instance(name: &HSTRING) -> Result<Option<InstanceGuard>> {
 fn main() {
     // Acquire before logging or starting any capture/tray threads.
     #[cfg(target_os = "linux")]
-    let _instance_guard = match acquire_linux_instance() {
-        Ok(Some(guard)) => guard,
+    let (_instance_guard, instance_error) = match acquire_linux_instance() {
+        Ok(Some(guard)) => (Some(guard), None),
         Ok(None) => return,
-        Err(error) => {
-            report_fatal(&error);
-            std::process::exit(1);
-        }
+        // The guard only prevents duplicates; a config dir that is read-only or
+        // lacks flock support (some NFS/FUSE homes) must not stop the daemon.
+        Err(error) => (None, Some(error)),
     };
 
     let config = config_io::load();
     let log_controller = logging::init(&config.logging);
+    #[cfg(target_os = "linux")]
+    if let Some(error) = instance_error {
+        tracing::warn!("single-instance guard unavailable, continuing without it: {error:#}");
+    }
     if let Err(error) = run(config, log_controller) {
         tracing::error!("fatal: {error:#}");
         report_fatal(&error);
@@ -79,11 +82,30 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn acquire_linux_instance() -> Result<Option<std::fs::File>> {
-    let directory = dirs::config_dir()
-        .context("no config directory")?
-        .join("mx-keyboard-switcher");
+    let directory = config_io::app_config_dir()?;
     std::fs::create_dir_all(&directory).context("create instance lock directory")?;
-    lock_instance_file(&directory.join("instance.lock"))
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    lock_instance_file(&directory.join(instance_lock_name(&display)))
+}
+
+/// Lock file name for one X display: the daemon serves a single `$DISPLAY`, so
+/// the same user may run one instance per X session (e.g. local `:0` plus
+/// xrdp `:10`), like the per-session Windows mutex.
+#[cfg(target_os = "linux")]
+fn instance_lock_name(display: &str) -> String {
+    // `:10` and `:10.0` are the same X server; drop the screen number.
+    let server = match display.rfind(':') {
+        Some(colon) => match display[colon..].find('.') {
+            Some(dot) => &display[..colon + dot],
+            None => display,
+        },
+        None => display,
+    };
+    let server: String = server
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("instance-{server}.lock")
 }
 
 #[cfg(target_os = "linux")]
@@ -117,6 +139,17 @@ mod linux_instance_tests {
         let next = lock_instance_file(&path).unwrap().unwrap();
         drop(next);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn lock_name_is_per_display_and_ignores_screen() {
+        assert_eq!(instance_lock_name(":10"), instance_lock_name(":10.0"));
+        assert_ne!(instance_lock_name(":0"), instance_lock_name(":10"));
+        assert_eq!(
+            instance_lock_name("host.example.com:10.0"),
+            "instance-host_example_com_10.lock"
+        );
+        assert!(!instance_lock_name("../x:1").contains('/'));
     }
 }
 
