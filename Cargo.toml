@@ -5,8 +5,8 @@ members = ["crates/mxks-core", "crates/mxks-platform", "crates/mxks-app"]
 [workspace.package]
 version = "0.2.17"
 edition = "2021"
-license = "MIT"
-authors = ["Max K"]
+license = "PolyForm-Noncommercial-1.0.0"
+authors = ["Maxim Kurganskiy"]
 repository = "https://github.com/itmaxk/mx-keyboard-switcher"
 
 [workspace.dependencies]

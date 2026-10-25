@@ -208,4 +208,13 @@ checklist.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[PolyForm Noncommercial 1.0.0](LICENSE): free for personal use and for
+noncommercial organizations (charities, education, public research, government).
+
+Commercial use, including use at or on behalf of a company, requires a separate
+license from the author. To request one, open an issue at
+<https://github.com/itmaxk/mx-keyboard-switcher/issues> or contact
+[@itmaxk](https://github.com/itmaxk).
+
+Releases up to and including v0.2.17 were published under the MIT license and
+remain available under its terms.
