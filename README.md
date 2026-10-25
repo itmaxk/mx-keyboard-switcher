@@ -20,9 +20,11 @@ single binary per OS.
   word and switch layout. Press it again with nothing typed in between to toggle
   the word back. Reassign it from the tray (**Change hotkey → press a key**) or
   in the config — matching is by key name, so any key or chord works.
-- **System tray**: enable/disable, toggle autocorrection, autocomplete and
-  terminal mode, change hotkeys, export/import autocomplete counters, open/reload
-  config, manage diagnostic file logging, toggle start at login.
+- **System tray**: the icon shows the active layout, with its key (EN or RU)
+  in front of the other one, and follows every switch, including the OS
+  shortcut. The menu toggles enable/disable, autocorrection, autocomplete and
+  terminal mode, changes hotkeys, exports/imports autocomplete counters,
+  opens/reloads the config, manages diagnostic file logging and start at login.
 - **Autocomplete learning**: only accepting a shown completion (including
   manually finishing that same suggestion and confirming it) increments its
   local word counter. Learned words can appear after one character and rank by

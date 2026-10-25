@@ -91,7 +91,12 @@ Run these checks with the default `tray` feature enabled:
 7. Choose a new log folder, enable diagnostic logging, and verify `mxks.log`
    appears there. **Open log folder** must open that directory. Disable logging
    and confirm the file stops growing; restart and verify both settings persist.
-8. Choose **Quit**. The icon must disappear and the process must exit cleanly
+8. Switch the layout with the OS shortcut, with the language indicator, and by
+   a conversion hotkey. Within about a quarter second the tray icon must show
+   the active layout's key (EN or RU) in front and the other behind, and the
+   tooltip must name it. Switch to a layout that is neither EN nor RU (add one
+   if needed): the icon must show both keys without letters.
+9. Choose **Quit**. The icon must disappear and the process must exit cleanly
    after the keyboard engine stops.
 
 ## Linux (X11)
@@ -174,9 +179,11 @@ limit; the test must not be marked passed based on cross-compilation alone.
 
 - Build the native MSVC release executable and launch it from Explorer or
   `Start-Process`. Confirm no console window appears.
-- Confirm Explorer shows the unique lime keyboard icon for
-  `mx-keyboard-switcher.exe`, and that the tray shows the same recognizable
-  icon rather than a generic application icon.
+- Confirm Explorer shows the EN/RU keycap icon for `mx-keyboard-switcher.exe`,
+  and that the tray shows the keycap icon for the active layout rather than a
+  generic application icon. At 100% display scaling the front letters must
+  still be readable. Windows keeps a layout per window: switching focus between
+  windows with different layouts must update the icon.
 - Run the common tray checks above, including checkmarks, both dynamic key
   labels, open/reload config, start-at-login, and clean Quit.
 - Verify the native fatal path by temporarily adding these as the first
@@ -212,9 +219,10 @@ limit; the test must not be marked passed based on cross-compilation alone.
 
 - Launch the release binary and confirm it creates no ordinary window and no
   Dock icon.
-- Confirm the keyboard icon remains recognizable in both light and dark
-  menu-bar appearances; it must not depend on its lime RGB colors to be
-  legible.
+- Confirm the keycap icon remains recognizable in both light and dark
+  menu-bar appearances. It is a template image (letters cut out of the front
+  key), so it must not depend on its lime RGB colors to be legible, and it must
+  stay a template after the layout changes.
 - Run the common tray checks above and confirm the menu states and dynamic
   labels match the Linux/Windows behavior. **Quit** must remove the menu-bar
   icon and terminate the process.
