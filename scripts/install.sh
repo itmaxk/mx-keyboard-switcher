@@ -21,7 +21,8 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --no-autostart   Install only; do not configure or start autostart
+  --no-autostart   Install only; do not configure autostart or start new
+                   instances (running instances are restarted on the new binary)
   --from-source    Skip prebuilt download; build with cargo
   --no-system-config
                    Linux: skip the keyboard layout checks and do not offer
@@ -76,6 +77,9 @@ warn() {
 
 die() {
   printf 'error: %s\n' "$*" >&2
+  if [ -n "${RESTART_ENV_DIR:-}" ]; then
+    rm -rf "$RESTART_ENV_DIR"
+  fi
   exit 1
 }
 
@@ -162,11 +166,47 @@ build_from_source() {
   SOURCE_TMP="$src_tmp"
 }
 
+# Stop running instances of the installed binary and wait until they exit, so
+# the new one does not lose the single-instance lock to the old process.
+# Matches the full command line: Linux truncates process names to 15 chars,
+# so `pkill -x mx-keyboard-switcher` never matches.
+#
+# On Linux each instance's environment is saved first (it vanishes from /proc
+# with the process), so restart_stopped_instances can bring the new binary
+# back on every X session, not only the one running the installer.
+stop_running_instance() {
+  pattern="${INSTALL_DIR}/${BIN}"
+  uid="$(id -u)"
+  pids="$(pgrep -u "$uid" -f "$pattern" 2>/dev/null)" || return 0
+  if [ "$(uname -s)" = "Linux" ]; then
+    if RESTART_ENV_DIR="$(mktemp -d)"; then
+      for pid in $pids; do
+        cat "/proc/${pid}/environ" >"${RESTART_ENV_DIR}/${pid}" 2>/dev/null ||
+          rm -f "${RESTART_ENV_DIR}/${pid}"
+      done
+    else
+      RESTART_ENV_DIR=""
+      warn "could not save the running ${BIN} sessions; other X sessions get it after re-login."
+    fi
+  fi
+  pkill -u "$uid" -f "$pattern" 2>/dev/null || return 0
+  tries=0
+  while pgrep -u "$uid" -f "$pattern" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -eq 50 ]; then
+      pkill -KILL -u "$uid" -f "$pattern" 2>/dev/null || true
+    elif [ "$tries" -ge 70 ]; then
+      warn "the running ${BIN} did not exit; the new version starts after re-login."
+      return 0
+    fi
+    sleep 0.1
+  done
+}
+
 install_binary() {
   [ -f "$SRC_BIN" ] || die "built binary not found: ${SRC_BIN}"
   mkdir -p "$INSTALL_DIR"
-  # Stop a running instance so the binary can be replaced.
-  pkill -x "$BIN" 2>/dev/null || true
+  stop_running_instance
   install -m 755 "$SRC_BIN" "${INSTALL_DIR}/${BIN}"
   log "Installed ${INSTALL_DIR}/${BIN}"
 
@@ -179,6 +219,55 @@ install_binary() {
       log "  export PATH=\"${INSTALL_DIR}:\$PATH\""
       ;;
   esac
+}
+
+# Start the new binary on every X display a stopped instance served, with that
+# instance's environment (DISPLAY, XAUTHORITY, the D-Bus bus for the tray).
+# Displays the installer already started on are skipped; the per-display lock
+# would make a duplicate exit anyway.
+restart_stopped_instances() {
+  [ -n "${RESTART_ENV_DIR:-}" ] || return 0
+  seen=" ${STARTED_DISPLAY:-} "
+  for env_file in "$RESTART_ENV_DIR"/*; do
+    [ -s "$env_file" ] || continue
+    display="$(tr '\0' '\n' <"$env_file" | sed -n 's/^DISPLAY=//p' | head -n 1)"
+    [ -n "$display" ] || continue
+    case "$seen" in *" ${display} "*) continue ;; esac
+    seen="${seen}${display} "
+    # env -i replaces the environment with the saved one; the inner sh
+    # detaches the daemon and prints its PID, so the env file can be removed
+    # right after.
+    # shellcheck disable=SC2016
+    if pid="$( (cat "$env_file"; printf '%s\0' /bin/sh -c \
+      'setsid "$0" </dev/null >/dev/null 2>&1 & echo "$!"' "${INSTALL_DIR}/${BIN}") |
+      xargs -0 env -i)" && [ -n "$pid" ]; then
+      STARTED_PIDS="${STARTED_PIDS} ${pid}:${display}"
+      log "Restarted ${BIN} on display ${display}."
+    else
+      warn "could not restart ${BIN} on display ${display}; it starts there after re-login."
+    fi
+  done
+  rm -rf "$RESTART_ENV_DIR"
+  RESTART_ENV_DIR=""
+}
+
+# A daemon that cannot open its X display (the session ended, XAUTHORITY
+# changed) or finds another instance there exits within milliseconds, so a
+# moment later each started PID tells whether it really runs. A start made
+# directly by this shell stays a zombie until reaped, hence the state check.
+verify_started_instances() {
+  [ -n "$STARTED_PIDS" ] || return 0
+  sleep 1
+  for entry in $STARTED_PIDS; do
+    pid="${entry%%:*}"
+    display="${entry#*:}"
+    state="$(ps -o stat= -p "$pid" 2>/dev/null)" || state=""
+    case "$state" in
+      "" | Z*)
+        warn "${BIN} exited right after starting on display ${display}; it starts there after re-login."
+        ;;
+    esac
+  done
 }
 
 write_linux_autostart() {
@@ -239,8 +328,9 @@ check_session_layouts() {
 #   (type 4; xrdp reads subtype 0 as 1) carrying the switch shortcut. xrdp
 #   ignores model/options in [default], and a later section with the same
 #   keyboard_type resets an earlier match, so it must be the last section.
+#   Its layouts map is patched too, even if no other section uses it yet.
 patch_xrdp_keyboard() {
-  awk -v grp="$2" '
+  awk -v grp="$2" -v mxks_map="default_layouts_map" '
     function section_name(line) {
       sub(/^[[:space:]]*\[/, "", line)
       sub(/\][[:space:]]*$/, "", line)
@@ -261,6 +351,7 @@ patch_xrdp_keyboard() {
       }
       next
     }
+    FNR == 1 && !ours { maps[mxks_map] = 1 }
     /^[[:space:]]*\[/ { sec = section_name($0) }
     sec in maps && /^[[:space:]]*rdp_layout_(us|ru)[[:space:]]*=/ {
       v = value($0)
@@ -282,7 +373,7 @@ patch_xrdp_keyboard() {
         print "model=pc105"
         print "options=" grp
         print "rdp_layouts=default_rdp_layouts"
-        print "layouts_map=default_layouts_map"
+        print "layouts_map=" mxks_map
       }
     }
   ' "$1" "$1"
@@ -290,13 +381,25 @@ patch_xrdp_keyboard() {
 
 check_xrdp_keyboard() {
   [ -f "$XRDP_KEYBOARD_INI" ] || return 0
+  # This check is optional: any failure below must not abort the install.
+  if [ ! -r "$XRDP_KEYBOARD_INI" ]; then
+    warn "cannot read ${XRDP_KEYBOARD_INI}; skipped the xrdp keyboard check."
+    return 0
+  fi
   if ! command -v diff >/dev/null 2>&1; then
     warn "xrdp detected but 'diff' is missing; skipped the xrdp keyboard check."
     return 0
   fi
   grp="${SESSION_GRP:-$DEFAULT_GRP_OPTION}"
-  patched="$(mktemp)"
-  patch_xrdp_keyboard "$XRDP_KEYBOARD_INI" "$grp" >"$patched"
+  if ! patched="$(mktemp)"; then
+    warn "could not create a temp file; skipped the xrdp keyboard check."
+    return 0
+  fi
+  if ! patch_xrdp_keyboard "$XRDP_KEYBOARD_INI" "$grp" >"$patched"; then
+    rm -f "$patched"
+    warn "could not patch a copy of ${XRDP_KEYBOARD_INI}; skipped the xrdp keyboard check."
+    return 0
+  fi
   if diff -q "$XRDP_KEYBOARD_INI" "$patched" >/dev/null; then
     rm -f "$patched"
     log "xrdp keyboard config already keeps us,ru."
@@ -366,6 +469,8 @@ configure_autostart() {
       write_linux_autostart
       if [ -n "${DISPLAY:-}" ]; then
         nohup setsid "${INSTALL_DIR}/${BIN}" >/dev/null 2>&1 &
+        STARTED_PIDS="${STARTED_PIDS} $!:${DISPLAY}"
+        STARTED_DISPLAY="$DISPLAY"
         log "Started ${BIN} in the background."
       else
         log "DISPLAY is unset — skipped immediate start (console/Wayland session?)."
@@ -405,6 +510,9 @@ main() {
   SRC_BIN=""
   PREBUILT_TMP=""
   SOURCE_TMP=""
+  RESTART_ENV_DIR=""
+  STARTED_DISPLAY=""
+  STARTED_PIDS=""
 
   if [ "$FROM_SOURCE" -eq 0 ] && [ -n "$TRIPLET" ]; then
     if [ -z "$VERSION" ]; then
@@ -456,6 +564,8 @@ main() {
   else
     log "Skipped autostart (--no-autostart)."
   fi
+  restart_stopped_instances
+  verify_started_instances
 
   print_done
 
